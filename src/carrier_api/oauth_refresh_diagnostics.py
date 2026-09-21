@@ -106,6 +106,7 @@ async def collect_oauth_refresh_diagnostics(
     *,
     parsed: object | None = None,
     status_override: int | None = None,
+    raw_body: bytes | None = None,
 ) -> OauthRefreshDiagnostics:
     """Collect secret-safe diagnostics from an OAuth refresh response.
 
@@ -114,6 +115,8 @@ async def collect_oauth_refresh_diagnostics(
         parsed: JSON value already decoded from the response, when available.
         status_override: HTTP status from a raised ``ClientResponseError`` when
             the response object does not expose ``status``.
+        raw_body: Body bytes already consumed before ``raise_for_status``. When
+            omitted, the response is read if it still exposes a body.
 
     Returns:
         Diagnostic fields that are safe to log.
@@ -121,19 +124,20 @@ async def collect_oauth_refresh_diagnostics(
     status = status_override
     content_type = None
     headers = None
-    raw_body = None
+    captured_raw_body = raw_body
     if response is not None:
         response_status = getattr(response, "status", None)
         if isinstance(response_status, int):
             status = response_status
         content_type = _response_content_type(response)
         headers = getattr(response, "headers", None)
-        raw_body = await _optional_raw_body(response)
+        if captured_raw_body is None:
+            captured_raw_body = await _optional_raw_body(response)
     return build_oauth_refresh_diagnostics(
         status=status,
         content_type=content_type,
         headers=headers,
-        raw_body=raw_body,
+        raw_body=captured_raw_body,
         parsed=parsed,
     )
 
@@ -173,6 +177,7 @@ async def log_oauth_refresh_response(
     *,
     parsed: object | None = None,
     status_override: int | None = None,
+    raw_body: bytes | None = None,
     level: int = WARNING,
 ) -> None:
     """Collect and log secret-safe OAuth refresh diagnostics.
@@ -185,6 +190,7 @@ async def log_oauth_refresh_response(
         response: aiohttp-like response, or ``None`` when no response exists.
         parsed: JSON value already decoded from the response, when available.
         status_override: HTTP status from a raised client error.
+        raw_body: Body bytes already consumed before ``raise_for_status``.
         level: Logging level for the record.
     """
     try:
@@ -192,6 +198,7 @@ async def log_oauth_refresh_response(
             response,
             parsed=parsed,
             status_override=status_override,
+            raw_body=raw_body,
         )
         emit_oauth_refresh_diagnostics(logger, diagnostics, level=level)
     except TypeError, ValueError, AttributeError, OSError, RuntimeError, KeyError:

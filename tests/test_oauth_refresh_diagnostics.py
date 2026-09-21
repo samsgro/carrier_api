@@ -329,6 +329,39 @@ async def test_collect_swallows_read_errors() -> None:
     assert diagnostics["body_length"] is None
 
 
+@pytest.mark.asyncio
+async def test_collect_uses_preconsumed_raw_body_when_read_fails() -> None:
+    """Prefer body bytes captured before raise_for_status released the payload."""
+
+    class ReleasedResponse:
+        """Response double whose body is no longer readable."""
+
+        status = 400
+        content_type = "application/json"
+        headers: ClassVar[dict[str, str]] = {"X-Request-Id": "req-preconsumed"}
+
+        async def read(self) -> bytes:
+            """Raise after aiohttp-style release.
+
+            Raises:
+                ClientError: Always raised for this double.
+            """
+            raise ClientError("Connection closed")
+
+    raw_body = b'{"error":"invalid_grant"}'
+    diagnostics = await collect_oauth_refresh_diagnostics(
+        ReleasedResponse(),
+        parsed={"error": "invalid_grant"},
+        raw_body=raw_body,
+    )
+
+    assert diagnostics["oauth_error"] == "invalid_grant"
+    assert diagnostics["body_class"] == "json_object"
+    assert diagnostics["body_length"] == len(raw_body)
+    assert diagnostics["body_sha256"] == sha256(raw_body).hexdigest()
+    assert diagnostics["request_ids"] == {"x-request-id": "req-preconsumed"}
+
+
 def test_emit_and_log_do_not_include_secrets(caplog: pytest.LogCaptureFixture) -> None:
     """Render only allowlisted fields into the log record."""
     logger = getLogger("carrier_api.oauth_refresh_diagnostics")

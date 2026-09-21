@@ -1,6 +1,7 @@
 """Tests for Carrier GraphQL API connection helpers."""
 
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from logging import DEBUG, WARNING
 from typing import Any, Self, cast
 
@@ -97,6 +98,91 @@ class FakeResponse:
         if self.json_error is not None:
             raise self.json_error
         return self.payload
+
+
+class ReleaseOnStatusFakeResponse:
+    """aiohttp-like response whose body becomes unreadable after raise_for_status.
+
+    Mirrors ``ClientResponse.raise_for_status`` calling ``release()`` before the
+    status error is raised, which drops an unread payload.
+    """
+
+    def __init__(
+        self,
+        payload: object,
+        status_error: ClientResponseError,
+        *,
+        raw_body: bytes,
+        headers: dict[str, str] | None = None,
+        content_type: str = "application/json",
+    ) -> None:
+        """Initialize a response that releases its body on status failure.
+
+        Args:
+            payload: JSON value returned by ``json`` before release.
+            status_error: Error raised by ``raise_for_status``.
+            raw_body: Raw bytes returned by ``read`` before release.
+            headers: Optional response headers exposed to diagnostics.
+            content_type: Content-Type exposed to diagnostics.
+        """
+        self._payload = payload
+        self._raw_body = raw_body
+        self.status_error = status_error
+        self.status = status_error.status
+        self.headers = headers or {}
+        self.content_type = content_type
+        self.raise_for_status_called = False
+        self.released = False
+        self.json_calls = 0
+        self.read_calls = 0
+
+    def _ensure_readable(self) -> None:
+        """Raise when aiohttp would have already released the payload.
+
+        Raises:
+            ClientConnectionError: After ``raise_for_status`` has released the
+                body.
+        """
+        if self.released:
+            raise ClientConnectionError("Connection closed")
+
+    def raise_for_status(self) -> None:
+        """Release the payload, then raise the configured status error.
+
+        Raises:
+            ClientResponseError: Always raised after the body is released.
+        """
+        self.raise_for_status_called = True
+        self.released = True
+        raise self.status_error
+
+    async def json(self) -> object:
+        """Return JSON only while the payload is still held.
+
+        Returns:
+            The fake response payload.
+
+        Raises:
+            ClientConnectionError: After ``raise_for_status`` has released the
+                body.
+        """
+        self.json_calls += 1
+        self._ensure_readable()
+        return self._payload
+
+    async def read(self) -> bytes:
+        """Return raw bytes only while the payload is still held.
+
+        Returns:
+            The fake raw body.
+
+        Raises:
+            ClientConnectionError: After ``raise_for_status`` has released the
+                body.
+        """
+        self.read_calls += 1
+        self._ensure_readable()
+        return self._raw_body
 
 
 class FakeSession:
@@ -987,7 +1073,111 @@ async def test_refresh_auth_token_ignores_adversarial_secret_payloads(
 
 def test_diagnostic_version_is_explicit() -> None:
     """Expose an explicit local diagnostic version for the fork pin."""
-    assert VERSION == "3.6.0+oauthdiag.1"
+    assert VERSION == "3.6.0+oauthdiag.2"
+
+
+@pytest.mark.asyncio
+async def test_releasing_response_body_is_unreadable_after_raise_for_status() -> None:
+    """Prove the aiohttp-like fake loses its body after raise_for_status."""
+    refresh_error = ClientResponseError(
+        request_info=None,  # type: ignore[arg-type]
+        history=(),
+        status=400,
+        message="bad request",
+    )
+    raw_body = b'{"error":"invalid_grant"}'
+    response = ReleaseOnStatusFakeResponse(
+        {"error": "invalid_grant"},
+        refresh_error,
+        raw_body=raw_body,
+    )
+
+    assert await response.json() == {"error": "invalid_grant"}
+    assert await response.read() == raw_body
+    with pytest.raises(ClientResponseError):
+        response.raise_for_status()
+    with pytest.raises(ClientConnectionError, match="Connection closed"):
+        await response.json()
+    with pytest.raises(ClientConnectionError, match="Connection closed"):
+        await response.read()
+
+
+@pytest.mark.asyncio
+async def test_refresh_auth_token_captures_invalid_grant_before_body_release(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Classify invalid_grant and hash the body even after raise_for_status."""
+    refresh_error = ClientResponseError(
+        request_info=None,  # type: ignore[arg-type]
+        history=(),
+        status=400,
+        message="bad request",
+    )
+    raw_body = b'{"error":"invalid_grant","error_description":"token expired"}'
+    session = FakeSession()
+    response = ReleaseOnStatusFakeResponse(
+        {
+            "error": "invalid_grant",
+            "error_description": "The refresh token is invalid or expired.",
+        },
+        refresh_error,
+        raw_body=raw_body,
+        headers={"X-Okta-Request-Id": "okta-release-1"},
+    )
+    session.response = response  # type: ignore[assignment]
+    connection = _refresh_connection(session)
+    caplog.set_level(WARNING, logger="carrier_api.api_connection_graphql")
+
+    with pytest.raises(errors.CarrierApiAuthError) as error:
+        await connection.refresh_auth_token()
+
+    assert error.value.__cause__ is refresh_error
+    assert response.raise_for_status_called
+    assert response.released
+    assert response.json_calls >= 1
+    assert response.read_calls >= 1
+    with pytest.raises(ClientConnectionError, match="Connection closed"):
+        await response.json()
+    assert "oauth_error=invalid_grant" in caplog.text
+    assert "The refresh token is invalid or expired." in caplog.text
+    assert f"body_sha256={sha256(raw_body).hexdigest()}" in caplog.text
+    assert "okta-release-1" in caplog.text
+    _assert_logs_are_secret_safe(caplog)
+
+
+@pytest.mark.asyncio
+async def test_refresh_auth_token_keeps_other_400_after_body_release(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Keep non-invalid_grant HTTP 400 in the token-refresh failure bucket."""
+    refresh_error = ClientResponseError(
+        request_info=None,  # type: ignore[arg-type]
+        history=(),
+        status=400,
+        message="bad request",
+    )
+    raw_body = b'{"error":"temporarily_unavailable"}'
+    session = FakeSession()
+    response = ReleaseOnStatusFakeResponse(
+        {
+            "error": "temporarily_unavailable",
+            "error_description": "The authorization server is busy.",
+        },
+        refresh_error,
+        raw_body=raw_body,
+    )
+    session.response = response  # type: ignore[assignment]
+    connection = _refresh_connection(session)
+    caplog.set_level(WARNING, logger="carrier_api.api_connection_graphql")
+
+    with pytest.raises(errors.CarrierApiTokenRefreshError) as error:
+        await connection.refresh_auth_token()
+
+    assert error.value.__cause__ is refresh_error
+    assert response.released
+    assert "oauth_error=temporarily_unavailable" in caplog.text
+    assert f"body_sha256={sha256(raw_body).hexdigest()}" in caplog.text
+    _assert_logs_are_secret_safe(caplog)
 
 
 @pytest.mark.asyncio

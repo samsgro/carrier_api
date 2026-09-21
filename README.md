@@ -31,21 +31,23 @@ python3.14 -m venv .venv
 .venv/bin/python -m pip install carrier_api
 ```
 
-### Diagnostic fork (`3.6.0+oauthdiag.1`)
+### Diagnostic fork (`3.6.0+oauthdiag.2`)
 
 This fork adds secret-safe OAuth refresh diagnostics only. It does not change
-thermostat behavior. Logs include HTTP status, content type, body class,
-body length/SHA-256, allowlisted OAuth `error`/`error_description`, and
-allowlisted request IDs. They never include username, password, tokens,
-cookies, the request body, `Authorization`, arbitrary headers, or the raw
-response body.
+thermostat behavior. Token refresh reads the OAuth JSON/body before aiohttp
+`raise_for_status` can release it, so `invalid_grant` can still become
+`CarrierApiAuthError` and the raw body can still be hashed. Logs include HTTP
+status, content type, body class, body length/SHA-256, allowlisted OAuth
+`error`/`error_description`, and allowlisted request IDs. They never include
+username, password, tokens, cookies, the request body, `Authorization`,
+arbitrary headers, or the raw response body.
 
 Install an immutable commit from the diagnostic branch:
 
 ```bash
 python3.14 -m venv .venv
 .venv/bin/python -m pip install \
-  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@0daa3d752d48d21fa84c51fde970de921fa96a99"
+  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@oauth-refresh-diagnostics"
 ```
 
 Rollback to the published upstream package:

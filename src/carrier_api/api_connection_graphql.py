@@ -25,7 +25,7 @@ from .errors import (
     CarrierApiGraphqlError,
     CarrierApiTokenRefreshError,
 )
-from .oauth_refresh_diagnostics import log_oauth_refresh_response
+from .oauth_refresh_diagnostics import _optional_raw_body, log_oauth_refresh_response
 from .profile import Profile
 from .status import Status
 from .system import System
@@ -50,19 +50,27 @@ def _is_auth_transport_error(error: BaseException) -> bool:
     return isinstance(error, TransportServerError) and error.code in _AUTH_HTTP_STATUSES
 
 
-async def _response_json_value(response: Any) -> object | None:
-    """Read a JSON response body when available.
+async def _consume_oauth_refresh_response(
+    response: Any,
+) -> tuple[bytes | None, object | None, BaseException | None]:
+    """Read OAuth refresh body bytes and JSON before status handling.
+
+    aiohttp's ``ClientResponse.raise_for_status`` calls ``release()`` before
+    raising, which can make a later ``json()`` or ``read()`` fail. Capture both
+    first so exception classification and secret-safe hashing still work.
 
     Args:
-        response: aiohttp-like response object with an async ``json`` method.
+        response: aiohttp-like response object.
 
     Returns:
-        The decoded JSON value, or ``None`` when the body is unreadable.
+        Raw body bytes when available, the decoded JSON value or ``None``, and
+        any JSON-read error to re-raise after a successful status check.
     """
+    raw_body = await _optional_raw_body(response)
     try:
-        return await response.json()
-    except ClientError, TimeoutError, OSError, TypeError, ValueError:
-        return None
+        return raw_body, await response.json(), None
+    except (ClientError, TimeoutError, OSError, TypeError, ValueError) as error:
+        return raw_body, None, error
 
 
 class ApiConnectionGraphql:
@@ -191,17 +199,22 @@ class ApiConnectionGraphql:
             "scope": "offline_access",
         }
         response: Any | None = None
+        raw_body: bytes | None = None
+        parsed: object | None = None
         try:
             response = await self.api_session.post(url=url, data=json_body)
+            raw_body, parsed, parse_error = await _consume_oauth_refresh_response(response)
             response.raise_for_status()
-            data = await response.json()
+            if parse_error is not None:
+                raise parse_error
+            data: Any = parsed
         except ClientResponseError as error:
-            parsed = None if response is None else await _response_json_value(response)
             data = parsed if isinstance(parsed, dict) else {}
             await log_oauth_refresh_response(
                 _LOGGER,
                 response,
                 parsed=parsed,
+                raw_body=raw_body,
                 status_override=error.status,
                 level=WARNING,
             )
@@ -214,7 +227,8 @@ class ApiConnectionGraphql:
             await log_oauth_refresh_response(
                 _LOGGER,
                 response,
-                parsed=None,
+                parsed=parsed,
+                raw_body=raw_body,
                 level=WARNING,
             )
             raise CarrierApiTokenRefreshError("Carrier token refresh failed") from error
@@ -228,6 +242,7 @@ class ApiConnectionGraphql:
                 _LOGGER,
                 response,
                 parsed=data,
+                raw_body=raw_body,
                 level=WARNING,
             )
             raise CarrierApiTokenRefreshError("Carrier token refresh failed") from error
@@ -235,6 +250,7 @@ class ApiConnectionGraphql:
             _LOGGER,
             response,
             parsed=data,
+            raw_body=raw_body,
             level=DEBUG,
         )
 
