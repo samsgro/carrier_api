@@ -47,7 +47,7 @@ Install an immutable commit from the diagnostic branch:
 ```bash
 python3.14 -m venv .venv
 .venv/bin/python -m pip install \
-  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@oauth-refresh-diagnostics"
+  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@8b938f201c140ca80c6530b6c8c96dd0128105d9"
 ```
 
 Rollback to the published upstream package:
