@@ -1,6 +1,7 @@
 """Tests for Carrier GraphQL API connection helpers."""
 
 from datetime import UTC, datetime, timedelta
+from logging import DEBUG, WARNING
 from typing import Any, Self, cast
 
 from aiohttp import ClientConnectionError, ClientError, ClientResponseError, ClientSession
@@ -11,8 +12,28 @@ import pytest
 import carrier_api
 from carrier_api import errors
 from carrier_api.api_connection_graphql import ApiConnectionGraphql
-from carrier_api.const import ActivityTypes, FanModes, HeatSourceTypes, SystemModes
+from carrier_api.const import VERSION, ActivityTypes, FanModes, HeatSourceTypes, SystemModes
 from carrier_api.system import System
+
+_SECRET_USERNAME = "secret-user@example.com"
+_SECRET_PASSWORD = "super-secret-password-xyz"
+_SECRET_ACCESS_TOKEN = "secret-access-token-aaa"
+_SECRET_REFRESH_TOKEN = "secret-refresh-token-bbb"
+_SECRET_NEW_REFRESH_TOKEN = "secret-rotated-refresh-ccc"
+_SECRET_COOKIE = "session=secret-cookie-value"
+_SECRET_AUTHORIZATION = "Bearer secret-auth-header"
+_SECRET_HTML = "<html><body>secret-in-html-body</body></html>"
+_FORBIDDEN_LOG_SECRETS = (
+    _SECRET_USERNAME,
+    _SECRET_PASSWORD,
+    _SECRET_ACCESS_TOKEN,
+    _SECRET_REFRESH_TOKEN,
+    _SECRET_NEW_REFRESH_TOKEN,
+    _SECRET_COOKIE,
+    _SECRET_AUTHORIZATION,
+    "secret-in-html-body",
+    "0oa1ce7hwjuZbfOMB4x7",
+)
 
 
 class FakeResponse:
@@ -23,6 +44,11 @@ class FakeResponse:
         payload: object,
         status_error: ClientResponseError | None = None,
         json_error: BaseException | None = None,
+        *,
+        status: int | None = None,
+        headers: dict[str, str] | None = None,
+        content_type: str | None = None,
+        raw_body: bytes | None = None,
     ) -> None:
         """Initialize the fake response with JSON payload data.
 
@@ -30,10 +56,23 @@ class FakeResponse:
             payload: Data returned from ``json``.
             status_error: Optional error raised by ``raise_for_status``.
             json_error: Optional error raised by ``json``.
+            status: Optional HTTP status exposed to diagnostics.
+            headers: Optional response headers exposed to diagnostics.
+            content_type: Optional Content-Type exposed to diagnostics.
+            raw_body: Optional raw body bytes used only for diagnostics.
         """
         self.payload = payload
         self.status_error = status_error
         self.json_error = json_error
+        if status is not None:
+            self.status = status
+        elif status_error is not None:
+            self.status = status_error.status
+        else:
+            self.status = 200
+        self.headers = headers or {}
+        self.content_type = content_type
+        self.raw_body = raw_body
         self.raise_for_status_called = False
 
     def raise_for_status(self) -> None:
@@ -684,6 +723,271 @@ async def test_refresh_auth_token_normalizes_malformed_success_payloads(
         await connection.refresh_auth_token()
 
     assert isinstance(error.value.__cause__, cause_type)
+
+
+def _assert_logs_are_secret_safe(caplog: pytest.LogCaptureFixture) -> None:
+    """Fail if captured logs contain credentials, tokens, or request bodies.
+
+    Args:
+        caplog: Pytest log capture fixture.
+    """
+    rendered = [record.getMessage() for record in caplog.records]
+    rendered.extend(str(record.args) for record in caplog.records)
+    combined = "\n".join(rendered)
+    for secret in _FORBIDDEN_LOG_SECRETS:
+        assert secret not in combined
+
+
+def _refresh_connection(session: FakeSession) -> ApiConnectionGraphql:
+    """Create a connection that posts token refresh through ``session``.
+
+    Args:
+        session: Fake aiohttp session.
+
+    Returns:
+        Connection configured with secret test credentials.
+    """
+    connection = ApiConnectionGraphql(
+        username=_SECRET_USERNAME,
+        password=_SECRET_PASSWORD,
+        client_session=cast("ClientSession", session),
+    )
+    connection.refresh_token = _SECRET_REFRESH_TOKEN
+    return connection
+
+
+@pytest.mark.asyncio
+async def test_refresh_auth_token_logs_safe_success_and_rotates_refresh(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Log allowlisted success diagnostics and rotate the refresh token."""
+    session = FakeSession()
+    session.response = FakeResponse(
+        {
+            "expires_in": 3600,
+            "token_type": "Bearer",
+            "access_token": _SECRET_ACCESS_TOKEN,
+            "refresh_token": _SECRET_NEW_REFRESH_TOKEN,
+        },
+        headers={"X-Request-Id": "req-success-123", "Authorization": _SECRET_AUTHORIZATION},
+        content_type="application/json",
+        raw_body=b'{"access_token":"secret-access-token-aaa"}',
+    )
+    connection = _refresh_connection(session)
+    caplog.set_level(DEBUG, logger="carrier_api.api_connection_graphql")
+
+    await connection.refresh_auth_token()
+
+    assert connection.access_token == _SECRET_ACCESS_TOKEN
+    assert connection.refresh_token == _SECRET_NEW_REFRESH_TOKEN
+    assert "body_class=json_object" in caplog.text
+    assert "status=200" in caplog.text
+    assert "req-success-123" in caplog.text
+    _assert_logs_are_secret_safe(caplog)
+
+
+@pytest.mark.asyncio
+async def test_refresh_auth_token_logs_safe_invalid_grant_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Log allowlisted invalid_grant fields while raising auth rejection."""
+    refresh_error = ClientResponseError(
+        request_info=None,  # type: ignore[arg-type]
+        history=(),
+        status=400,
+        message="bad request",
+    )
+    session = FakeSession()
+    session.response = FakeResponse(
+        {
+            "error": "invalid_grant",
+            "error_description": "The refresh token is invalid or expired.",
+        },
+        status_error=refresh_error,
+        headers={"X-Okta-Request-Id": "okta-req-789"},
+        content_type="application/json",
+        raw_body=b'{"error":"invalid_grant"}',
+    )
+    connection = _refresh_connection(session)
+    caplog.set_level(WARNING, logger="carrier_api.api_connection_graphql")
+
+    with pytest.raises(errors.CarrierApiAuthError) as error:
+        await connection.refresh_auth_token()
+
+    assert error.value.__cause__ is refresh_error
+    assert "oauth_error=invalid_grant" in caplog.text
+    assert "The refresh token is invalid or expired." in caplog.text
+    assert "okta-req-789" in caplog.text
+    _assert_logs_are_secret_safe(caplog)
+
+
+@pytest.mark.asyncio
+async def test_refresh_auth_token_logs_other_json_error_without_changing_bucket(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Keep non-invalid_grant JSON errors in the token-refresh failure bucket."""
+    refresh_error = ClientResponseError(
+        request_info=None,  # type: ignore[arg-type]
+        history=(),
+        status=400,
+        message="bad request",
+    )
+    session = FakeSession()
+    session.response = FakeResponse(
+        {
+            "error": "temporarily_unavailable",
+            "error_description": "The authorization server is busy.",
+        },
+        status_error=refresh_error,
+        content_type="application/json; charset=utf-8",
+        raw_body=b'{"error":"temporarily_unavailable"}',
+    )
+    connection = _refresh_connection(session)
+    caplog.set_level(WARNING, logger="carrier_api.api_connection_graphql")
+
+    with pytest.raises(errors.CarrierApiTokenRefreshError) as error:
+        await connection.refresh_auth_token()
+
+    assert error.value.__cause__ is refresh_error
+    assert "oauth_error=temporarily_unavailable" in caplog.text
+    assert "The authorization server is busy." in caplog.text
+    _assert_logs_are_secret_safe(caplog)
+
+
+@pytest.mark.asyncio
+async def test_refresh_auth_token_logs_html_challenge_without_body(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Classify HTML challenge bodies without logging the HTML."""
+    refresh_error = ClientResponseError(
+        request_info=None,  # type: ignore[arg-type]
+        history=(),
+        status=403,
+        message="forbidden",
+    )
+    session = FakeSession()
+    session.response = FakeResponse(
+        {},
+        status_error=refresh_error,
+        json_error=ValueError("not json"),
+        headers={"Content-Type": "text/html; charset=utf-8"},
+        content_type="text/html; charset=utf-8",
+        raw_body=_SECRET_HTML.encode(),
+    )
+    connection = _refresh_connection(session)
+    caplog.set_level(WARNING, logger="carrier_api.api_connection_graphql")
+
+    with pytest.raises(errors.CarrierApiAuthError) as error:
+        await connection.refresh_auth_token()
+
+    assert error.value.__cause__ is refresh_error
+    assert "body_class=html" in caplog.text
+    assert "status=403" in caplog.text
+    assert _SECRET_HTML not in caplog.text
+    _assert_logs_are_secret_safe(caplog)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_body", "json_error", "expected_class"),
+    [
+        (b"", ValueError("empty"), "empty"),
+        (b"{not json", ValueError("invalid json"), "malformed"),
+    ],
+)
+async def test_refresh_auth_token_logs_empty_or_malformed_bodies(
+    raw_body: bytes,
+    json_error: ValueError,
+    expected_class: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Classify empty and malformed refresh bodies without logging contents.
+
+    Args:
+        raw_body: Raw diagnostic body bytes.
+        json_error: Error raised while decoding JSON.
+        expected_class: Expected body class in the diagnostic log.
+        caplog: Pytest log capture fixture.
+    """
+    refresh_error = ClientResponseError(
+        request_info=None,  # type: ignore[arg-type]
+        history=(),
+        status=400,
+        message="bad request",
+    )
+    session = FakeSession()
+    session.response = FakeResponse(
+        {},
+        status_error=refresh_error,
+        json_error=json_error,
+        content_type="application/json",
+        raw_body=raw_body,
+    )
+    connection = _refresh_connection(session)
+    caplog.set_level(WARNING, logger="carrier_api.api_connection_graphql")
+
+    with pytest.raises(errors.CarrierApiTokenRefreshError) as error:
+        await connection.refresh_auth_token()
+
+    assert error.value.__cause__ is refresh_error
+    assert f"body_class={expected_class}" in caplog.text
+    assert raw_body.decode("utf-8", errors="replace") not in caplog.text or raw_body == b""
+    _assert_logs_are_secret_safe(caplog)
+
+
+@pytest.mark.asyncio
+async def test_refresh_auth_token_ignores_adversarial_secret_payloads(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Omit unsafe OAuth fields, headers, and body secrets from diagnostics."""
+    refresh_error = ClientResponseError(
+        request_info=None,  # type: ignore[arg-type]
+        history=(),
+        status=400,
+        message="bad request",
+    )
+    jwt_secret = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.secret-signature-value"
+    )
+    session = FakeSession()
+    session.response = FakeResponse(
+        {
+            "error": jwt_secret,
+            "error_description": f"password={_SECRET_PASSWORD} access_token={_SECRET_ACCESS_TOKEN}",
+            "access_token": _SECRET_ACCESS_TOKEN,
+            "refresh_token": _SECRET_NEW_REFRESH_TOKEN,
+        },
+        status_error=refresh_error,
+        headers={
+            "Authorization": _SECRET_AUTHORIZATION,
+            "Cookie": _SECRET_COOKIE,
+            "Set-Cookie": _SECRET_COOKIE,
+            "X-Request-Id": "req-safe-999",
+            "X-Evil-Token": _SECRET_ACCESS_TOKEN,
+        },
+        content_type="application/json",
+        raw_body=(
+            b'{"error":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret","access_token":'
+            b'"secret-access-token-aaa"}'
+        ),
+    )
+    connection = _refresh_connection(session)
+    caplog.set_level(DEBUG, logger="carrier_api.api_connection_graphql")
+
+    with pytest.raises(errors.CarrierApiTokenRefreshError) as error:
+        await connection.refresh_auth_token()
+
+    assert error.value.__cause__ is refresh_error
+    assert "req-safe-999" in caplog.text
+    assert "oauth_error=None" in caplog.text
+    assert "oauth_error_description=None" in caplog.text
+    assert jwt_secret not in caplog.text
+    _assert_logs_are_secret_safe(caplog)
+
+
+def test_diagnostic_version_is_explicit() -> None:
+    """Expose an explicit local diagnostic version for the fork pin."""
+    assert VERSION == "3.6.0+oauthdiag.1"
 
 
 @pytest.mark.asyncio

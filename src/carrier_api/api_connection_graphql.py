@@ -1,7 +1,7 @@
 """GraphQL client for Carrier authentication, queries, and config updates."""
 
 from datetime import UTC, datetime, timedelta
-from logging import getLogger
+from logging import DEBUG, WARNING, getLogger
 from typing import Any, Literal
 
 from aiohttp import ClientError, ClientResponseError, ClientSession
@@ -25,6 +25,7 @@ from .errors import (
     CarrierApiGraphqlError,
     CarrierApiTokenRefreshError,
 )
+from .oauth_refresh_diagnostics import log_oauth_refresh_response
 from .profile import Profile
 from .status import Status
 from .system import System
@@ -49,23 +50,19 @@ def _is_auth_transport_error(error: BaseException) -> bool:
     return isinstance(error, TransportServerError) and error.code in _AUTH_HTTP_STATUSES
 
 
-async def _response_json_object(response: Any) -> dict[str, Any]:
-    """Read a JSON object response body when available.
+async def _response_json_value(response: Any) -> object | None:
+    """Read a JSON response body when available.
 
     Args:
         response: aiohttp-like response object with an async ``json`` method.
 
     Returns:
-        The decoded JSON object, or an empty object when the body is malformed
-        or is not a JSON object.
+        The decoded JSON value, or ``None`` when the body is unreadable.
     """
     try:
-        data = await response.json()
+        return await response.json()
     except ClientError, TimeoutError, OSError, TypeError, ValueError:
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    return data
+        return None
 
 
 class ApiConnectionGraphql:
@@ -199,13 +196,27 @@ class ApiConnectionGraphql:
             response.raise_for_status()
             data = await response.json()
         except ClientResponseError as error:
-            data = {} if response is None else await _response_json_object(response)
+            parsed = None if response is None else await _response_json_value(response)
+            data = parsed if isinstance(parsed, dict) else {}
+            await log_oauth_refresh_response(
+                _LOGGER,
+                response,
+                parsed=parsed,
+                status_override=error.status,
+                level=WARNING,
+            )
             if error.status in {401, 403} or (
                 error.status == 400 and data.get("error") == "invalid_grant"
             ):
                 raise CarrierApiAuthError("Carrier token refresh was rejected") from error
             raise CarrierApiTokenRefreshError("Carrier token refresh failed") from error
         except (ClientError, TimeoutError, OSError, TypeError, ValueError) as error:
+            await log_oauth_refresh_response(
+                _LOGGER,
+                response,
+                parsed=None,
+                level=WARNING,
+            )
             raise CarrierApiTokenRefreshError("Carrier token refresh failed") from error
         try:
             self.expires_at = datetime.now(UTC) + timedelta(seconds=data["expires_in"])
@@ -213,7 +224,19 @@ class ApiConnectionGraphql:
             self.access_token = data["access_token"]
             self.refresh_token = data["refresh_token"]
         except (KeyError, TypeError) as error:
+            await log_oauth_refresh_response(
+                _LOGGER,
+                response,
+                parsed=data,
+                level=WARNING,
+            )
             raise CarrierApiTokenRefreshError("Carrier token refresh failed") from error
+        await log_oauth_refresh_response(
+            _LOGGER,
+            response,
+            parsed=data,
+            level=DEBUG,
+        )
 
     async def authed_query(
         self, operation_name: str, query: GraphQLRequest, variable_values: dict[str, Any]
@@ -1030,7 +1053,7 @@ class ApiConnectionGraphql:
 
         Returns:
             The decoded mutation response.
-        
+
         Raises:
             ValueError: If ``fan_mode`` or ``activity_type`` is not a valid enum
                 member.

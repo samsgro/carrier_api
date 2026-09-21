@@ -31,6 +31,29 @@ python3.14 -m venv .venv
 .venv/bin/python -m pip install carrier_api
 ```
 
+### Diagnostic fork (`3.6.0+oauthdiag.1`)
+
+This fork adds secret-safe OAuth refresh diagnostics only. It does not change
+thermostat behavior. Logs include HTTP status, content type, body class,
+body length/SHA-256, allowlisted OAuth `error`/`error_description`, and
+allowlisted request IDs. They never include username, password, tokens,
+cookies, the request body, `Authorization`, arbitrary headers, or the raw
+response body.
+
+Install an immutable commit from the diagnostic branch:
+
+```bash
+python3.14 -m venv .venv
+.venv/bin/python -m pip install \
+  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@<commit-sha>"
+```
+
+Rollback to the published upstream package:
+
+```bash
+.venv/bin/python -m pip install --force-reinstall "carrier-api==3.6.0"
+```
+
 ## Live Smoke Test
 
 The live smoke test connects to a real Carrier account, prints loaded system state, starts websocket listeners, and sends one sample manual activity update to the first available zone.
