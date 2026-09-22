@@ -12,7 +12,7 @@ import pytest
 
 import carrier_api
 from carrier_api import errors
-from carrier_api.api_connection_graphql import ApiConnectionGraphql
+from carrier_api.api_connection_graphql import GRAPHQL_EXECUTE_TIMEOUT_SECONDS, ApiConnectionGraphql
 from carrier_api.const import VERSION, ActivityTypes, FanModes, HeatSourceTypes, SystemModes
 from carrier_api.system import System
 
@@ -436,7 +436,29 @@ async def test_authed_query_uses_extended_execute_timeout(monkeypatch: pytest.Mo
         variable_values={},
     )
 
-    assert FakeGraphQLClient.execute_timeout == 60
+    assert FakeGraphQLClient.execute_timeout == GRAPHQL_EXECUTE_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_assisted_login_uses_graphql_execute_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Assisted login uses the same GraphQL execute timeout as authenticated queries."""
+    FakeGraphQLClient.execute_timeout = None
+    monkeypatch.setattr(
+        "carrier_api.api_connection_graphql.Client",
+        FakeGraphQLClient,
+    )
+    connection = ApiConnectionGraphql(
+        username="user@example.com",
+        password="password",
+        client_session=cast("ClientSession", FakeSession()),
+    )
+
+    result = await connection._execute_assisted_login()
+
+    assert FakeGraphQLClient.execute_timeout == GRAPHQL_EXECUTE_TIMEOUT_SECONDS
+    assert result["operation_name"] == "assistedLogin"
 
 
 @pytest.fixture

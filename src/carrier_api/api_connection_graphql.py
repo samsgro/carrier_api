@@ -53,6 +53,8 @@ _SESSION_EVENTS = frozenset(
         "refresh_suppressed",
         "recovery_started",
         "recovery_finished",
+        "recovery_attempt",
+        "recovery_backoff",
         "ws_reconnect_requested",
     }
 )
@@ -66,6 +68,7 @@ _SESSION_OUTCOMES = frozenset(
         "cancelled",
         "login_failed",
         "login_transient",
+        "exhausted",
     }
 )
 _SESSION_WS_ACTIONS = frozenset({"none", "reconnect_requested", "left_connected"})
@@ -118,6 +121,7 @@ class TokenSessionState(StrEnum):
     ACTIVE = "ACTIVE"
     REFRESH_IN_FLIGHT = "REFRESH_IN_FLIGHT"
     RECOVERY_LOGIN = "RECOVERY_LOGIN"
+    RECOVERY_PENDING = "RECOVERY_PENDING"
     AUTH_FAILED = "AUTH_FAILED"
 
 
@@ -497,6 +501,7 @@ class ApiConnectionGraphql:
         ws_action: str = "none",
         recovery_eligible: bool | None = None,
         suppressed: bool | None = None,
+        attempt: int | None = None,
     ) -> None:
         """Emit one allowlisted token-session orchestration log line.
 
@@ -512,11 +517,13 @@ class ApiConnectionGraphql:
             ws_action: Allowlisted websocket action.
             recovery_eligible: Whether recovery may run for this outcome.
             suppressed: Whether this refresh fingerprint is suppressed.
+            attempt: Recovery attempt number when relevant.
         """
         safe_event = event if event in _SESSION_EVENTS else "refresh_finished"
         safe_purpose = purpose if purpose in _SESSION_PURPOSES else "refresh"
         safe_outcome = outcome if outcome in _SESSION_OUTCOMES else "transient"
         safe_ws_action = ws_action if ws_action in _SESSION_WS_ACTIONS else "none"
+        attempt_label = None if attempt is None else f"{attempt}/{RECOVERY_MAX_ATTEMPTS}"
         if access_valid is None:
             access_valid = self._seconds_until_expiry(self._now()) > 0
         if seconds_until_expiry is None:
@@ -531,17 +538,18 @@ class ApiConnectionGraphql:
             self._last_refresh_fp12 = refresh_fp12
         self._last_session_event = safe_event
         self._last_session_outcome = safe_outcome
-        if safe_outcome == "success":
-            level = DEBUG
-        elif safe_event == "recovery_started":
+        if safe_event in {"recovery_started", "recovery_attempt"}:
             level = INFO
+        elif safe_outcome == "success":
+            level = DEBUG
         else:
             level = WARNING
         _LOGGER.log(
             level,
             "Carrier OAuth token session event=%s state=%s purpose=%s outcome=%s "
             "access_valid=%s seconds_until_expiry=%s delay_s=%s generation=%s "
-            "refresh_fp12=%s ws_action=%s recovery_eligible=%s suppressed=%s",
+            "refresh_fp12=%s ws_action=%s recovery_eligible=%s suppressed=%s "
+            "attempt=%s",
             safe_event,
             self._state.value,
             safe_purpose,
@@ -554,6 +562,7 @@ class ApiConnectionGraphql:
             safe_ws_action,
             recovery_eligible,
             suppressed,
+            attempt_label,
         )
 
     async def _ensure_tokens_locked(self) -> None:
@@ -598,6 +607,7 @@ class ApiConnectionGraphql:
         async with Client(
             transport=transport,
             fetch_schema_from_transport=False,
+            execute_timeout=GRAPHQL_EXECUTE_TIMEOUT_SECONDS,
         ) as session:
             query = gql(
                 """
@@ -742,6 +752,12 @@ class ApiConnectionGraphql:
         for attempt in range(1, RECOVERY_MAX_ATTEMPTS + 1):
             if self._closing:
                 raise CarrierApiTokenRefreshError("Carrier token session is closing")
+            self._emit_session_log(
+                event="recovery_attempt",
+                purpose="recovery",
+                outcome="success",
+                attempt=attempt,
+            )
             try:
                 await self._login_locked(purpose="recovery")
             except CarrierApiAuthError:
@@ -749,8 +765,22 @@ class ApiConnectionGraphql:
             except (CarrierApiConnectionError, CarrierApiGraphqlError) as error:
                 last_error = error
                 if attempt >= RECOVERY_MAX_ATTEMPTS:
+                    self._state = TokenSessionState.RECOVERY_PENDING
+                    self._emit_session_log(
+                        event="recovery_finished",
+                        purpose="recovery",
+                        outcome="exhausted",
+                        attempt=attempt,
+                    )
                     break
                 delay = RECOVERY_BACKOFF_SECONDS[attempt - 1]
+                self._emit_session_log(
+                    event="recovery_backoff",
+                    purpose="recovery",
+                    outcome="login_transient",
+                    delay_s=delay,
+                    attempt=attempt,
+                )
                 await self._sleep_fn(delay)
                 continue
             if self.ws_generation != generation_before:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from logging import WARNING
+from logging import INFO, WARNING
 from typing import Any, Self, cast
 
 from aiohttp import ClientConnectionError, ClientResponseError, ClientSession
@@ -431,7 +431,12 @@ async def test_three_transient_logins_are_retryable_and_skip_refresh_next_cycle(
     assert writer_calls == []
     assert connection.access_token == _LOGIN_ACCESS
     assert connection.refresh_token == _LOGIN_REFRESH
-    assert connection._state is not TokenSessionState.AUTH_FAILED
+    assert connection._state is TokenSessionState.RECOVERY_PENDING
+    diagnostics = connection.token_session_diagnostics()
+    assert diagnostics["state"] == "RECOVERY_PENDING"
+    assert diagnostics["last_outcome"] == "exhausted"
+    assert _LOGIN_ACCESS not in str(diagnostics)
+    assert _LOGIN_REFRESH not in str(diagnostics)
 
     sleep.delays.clear()
     await connection.check_auth_expiration()
@@ -441,6 +446,43 @@ async def test_three_transient_logins_are_retryable_and_skip_refresh_next_cycle(
     assert sleep.delays == []
     assert connection.access_token == "later-access"
     assert connection._state is TokenSessionState.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_recovery_logs_identify_attempt_and_backoff_without_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Recovery logs name attempt n/3 and next delay, never secrets or exceptions."""
+    session = CountingSession()
+    session.response = FakeResponse({"error": "invalid_grant"}, status_error=_auth_error(400))
+    sleep = RecordingSleep()
+    connection = _connection(session, sleep=sleep)
+    _install_pair(connection, expires_in=-1)
+    login = ScriptedLogin(
+        ClientConnectionError(f"transport {_SECRET_PASSWORD}"),
+        ClientConnectionError(f"timeout {_SECRET_ACCESS_TOKEN}"),
+        ClientConnectionError(f"graphql {_SECRET_NEW_REFRESH_TOKEN}"),
+    )
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+    caplog.set_level(INFO, logger="carrier_api.api_connection_graphql")
+
+    with pytest.raises(CarrierApiTokenRefreshError):
+        await connection.check_auth_expiration()
+
+    assert "event=recovery_attempt" in caplog.text
+    assert "event=recovery_backoff" in caplog.text
+    assert "attempt=1/3" in caplog.text
+    assert "attempt=2/3" in caplog.text
+    assert "attempt=3/3" in caplog.text
+    assert "delay_s=1.0" in caplog.text
+    assert "delay_s=3.0" in caplog.text
+    assert "outcome=exhausted" in caplog.text
+    assert connection._state is TokenSessionState.RECOVERY_PENDING
+    assert f"transport {_SECRET_PASSWORD}" not in caplog.text
+    assert f"timeout {_SECRET_ACCESS_TOKEN}" not in caplog.text
+    assert f"graphql {_SECRET_NEW_REFRESH_TOKEN}" not in caplog.text
+    _assert_logs_are_secret_safe(caplog)
 
 
 @pytest.mark.asyncio
@@ -873,6 +915,7 @@ async def test_recovery_transport_failure_keeps_no_invented_token(
 
     assert connection._pair is original
     assert connection.access_token == _LOGIN_ACCESS
+    assert connection._state is TokenSessionState.RECOVERY_PENDING
     assert sleep.delays == [1.0, 3.0]
 
 
