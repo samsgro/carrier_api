@@ -226,10 +226,24 @@ class FakeListenerConnection(DummyApiConnectionGraphql):
         self.listener_session = FakeListenerSession(websocket)
         self.api_session = cast("ClientSession", self.listener_session)
         self.auth_checked = False
+        self._ws_generation = 0
+
+    @property
+    def ws_generation(self) -> int:
+        """Return the test connection's websocket generation."""
+        return self._ws_generation
 
     async def check_auth_expiration(self) -> None:
         """Record auth expiration checks."""
         self.auth_checked = True
+
+    async def snapshot_websocket_auth(self) -> tuple[str, int]:
+        """Return a locked-style token and generation snapshot."""
+        self.auth_checked = True
+        token = self.access_token
+        if token is None:
+            raise RuntimeError("websocket snapshot requires an access token")
+        return token, self.ws_generation
 
 
 class FailingListenerConnection(DummyApiConnectionGraphql):
@@ -246,10 +260,24 @@ class FailingListenerConnection(DummyApiConnectionGraphql):
         self.listener_session = FailingListenerSession(error)
         self.api_session = cast("ClientSession", self.listener_session)
         self.auth_checked = False
+        self._ws_generation = 0
+
+    @property
+    def ws_generation(self) -> int:
+        """Return the test connection's websocket generation."""
+        return self._ws_generation
 
     async def check_auth_expiration(self) -> None:
         """Record auth expiration checks."""
         self.auth_checked = True
+
+    async def snapshot_websocket_auth(self) -> tuple[str, int]:
+        """Return a locked-style token and generation snapshot."""
+        self.auth_checked = True
+        token = self.access_token
+        if token is None:
+            raise RuntimeError("websocket snapshot requires an access token")
+        return token, self.ws_generation
 
 
 class FakeHeartbeatApiWebsocket(ApiWebsocket):
@@ -408,3 +436,121 @@ async def test_listener_raises_websocket_error_messages(
     assert heartbeat_task.cancelled
     assert api_websocket.websocket is None
     assert api_websocket.task_heartbeat is None
+
+
+class SnapshotOnlyConnection(FakeListenerConnection):
+    """Connection that rotates access_token after the locked snapshot."""
+
+    async def snapshot_websocket_auth(self) -> tuple[str, int]:
+        """Return snapshot locals, then change the attribute a later read would see.
+
+        Returns:
+            Snapshot token and generation.
+        """
+        self.auth_checked = True
+        snapshot_token = "snapshot-token"
+        self.access_token = "later-token"
+        return snapshot_token, 7
+
+
+@pytest.mark.asyncio
+async def test_listener_connects_with_snapshot_locals_not_later_access_token() -> None:
+    """WS1: listener connect URL uses snapshot locals, not a later attribute."""
+    websocket = FakeListenerWebsocket([])
+    connection = SnapshotOnlyConnection(websocket)
+    heartbeat_task = FakeHeartbeatTask()
+    api_websocket = FakeHeartbeatApiWebsocket(connection, heartbeat_task)
+
+    await api_websocket.listener()
+
+    assert connection.listener_session.connected_url == (
+        "wss://realtime.infinity.iot.carrier.com/?Token=snapshot-token"
+    )
+    assert connection.access_token == "later-token"
+
+
+class GenerationBumpWebsocket(FakeListenerWebsocket):
+    """Websocket that bumps generation before the second message."""
+
+    def __init__(
+        self,
+        messages: list[SimpleNamespace],
+        connection: FakeListenerConnection,
+    ) -> None:
+        """Initialize with a connection whose generation can change.
+
+        Args:
+            messages: Messages yielded by the websocket iterator.
+            connection: Connection whose generation is bumped mid-loop.
+        """
+        super().__init__(messages)
+        self.connection = connection
+        self.yielded = 0
+
+    async def __anext__(self) -> SimpleNamespace:
+        """Bump generation before the second message.
+
+        Returns:
+            The next fake websocket message.
+
+        Raises:
+            StopAsyncIteration: When no messages remain.
+        """
+        if self.yielded == 1:
+            self.connection._ws_generation = 99
+        self.yielded += 1
+        return await super().__anext__()
+
+
+@pytest.mark.asyncio
+async def test_listener_closes_when_generation_changes_without_auth_error() -> None:
+    """X7: a generation bump mid-receive closes the listener without AuthError."""
+    connection = FakeListenerConnection(
+        FakeListenerWebsocket(
+            [
+                SimpleNamespace(type=WSMsgType.TEXT, data="first"),
+                SimpleNamespace(type=WSMsgType.TEXT, data="second"),
+            ]
+        )
+    )
+    websocket = GenerationBumpWebsocket(
+        [
+            SimpleNamespace(type=WSMsgType.TEXT, data="first"),
+            SimpleNamespace(type=WSMsgType.TEXT, data="second"),
+        ],
+        connection,
+    )
+    connection.listener_session = FakeListenerSession(websocket)
+    connection.api_session = cast("ClientSession", connection.listener_session)
+    heartbeat_task = FakeHeartbeatTask()
+    api_websocket = FakeHeartbeatApiWebsocket(connection, heartbeat_task)
+    received: list[str] = []
+
+    async def capture(message: str) -> None:
+        """Capture dispatched websocket messages.
+
+        Args:
+            message: Raw websocket text.
+        """
+        received.append(message)
+
+    api_websocket.callback_add(capture)
+
+    await api_websocket.listener()
+
+    assert received == ["first"]
+    assert websocket.closed
+    assert heartbeat_task.cancelled
+
+
+@pytest.mark.asyncio
+async def test_request_reconnect_closes_open_socket() -> None:
+    """Close the current websocket when a committed rotation requests reconnect."""
+    websocket = FakeListenerWebsocket([])
+    connection = FakeListenerConnection(websocket)
+    api_websocket = ApiWebsocket(connection)
+    api_websocket.websocket = websocket  # type: ignore[assignment]
+
+    await api_websocket.request_reconnect()
+
+    assert websocket.closed

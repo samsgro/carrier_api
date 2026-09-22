@@ -186,10 +186,21 @@ class WorkflowConnection:
         self.api_session = self.workflow_session
         self.api_websocket: ApiWebsocket | None = None
         self.auth_checks = 0
+        self._ws_generation = 0
+
+    @property
+    def ws_generation(self) -> int:
+        """Return the workflow connection's websocket generation."""
+        return self._ws_generation
 
     async def check_auth_expiration(self) -> None:
         """Record auth checks before websocket connection."""
         self.auth_checks += 1
+
+    async def snapshot_websocket_auth(self) -> tuple[str, int]:
+        """Return a locked-style token and generation snapshot."""
+        self.auth_checks += 1
+        return self.access_token, self.ws_generation
 
 
 class WorkflowApiWebsocket(ApiWebsocket):

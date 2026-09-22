@@ -346,8 +346,13 @@ class SpyConnection(ApiConnectionGraphql):
         self.refresh_token = "refresh"
         self.expires_at = datetime.now(UTC) + timedelta(hours=1)
 
-    async def refresh_auth_token(self) -> None:
-        """Record refresh calls and extend token state."""
+    async def refresh_auth_token(self, *, purpose: str = "refresh") -> None:
+        """Record refresh calls and extend token state.
+
+        Args:
+            purpose: Refresh purpose accepted for compatibility with the
+                superclass signature.
+        """
         self.refresh_count += 1
         self.expires_at = datetime.now(UTC) + timedelta(hours=1)
 
@@ -585,6 +590,7 @@ async def test_refresh_auth_token_updates_token_state() -> None:
     assert connection.token_type == "Bearer"
     assert connection.access_token == "new-access"
     assert connection.refresh_token == "new-refresh"
+    assert connection.expires_at is not None
     assert connection.expires_at > datetime.now(UTC)
 
 
@@ -809,6 +815,11 @@ async def test_refresh_auth_token_normalizes_malformed_success_payloads(
         await connection.refresh_auth_token()
 
     assert isinstance(error.value.__cause__, cause_type)
+    assert connection.refresh_token == "old-refresh"
+    assert connection.access_token is None
+    assert connection.token_type is None
+    assert connection.expires_at is None
+    assert connection._pair is None
 
 
 def _assert_logs_are_secret_safe(caplog: pytest.LogCaptureFixture) -> None:
@@ -1073,7 +1084,7 @@ async def test_refresh_auth_token_ignores_adversarial_secret_payloads(
 
 def test_diagnostic_version_is_explicit() -> None:
     """Expose an explicit local diagnostic version for the fork pin."""
-    assert VERSION == "3.6.0+oauthdiag.2"
+    assert VERSION == "3.6.0+oauthdiag.3"
 
 
 @pytest.mark.asyncio

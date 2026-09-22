@@ -1,8 +1,10 @@
 """Carrier API exception types."""
 
-from typing import Any
+from typing import Any, Literal
 
 from aiohttp import ClientError
+
+AuthErrorReason = Literal["invalid_grant", "unauthorized", "login_failed"]
 
 
 class CarrierApiError(Exception):
@@ -21,6 +23,25 @@ class CarrierApiError(Exception):
 
 class CarrierApiAuthError(CarrierApiError):
     """Raised when Carrier authentication fails or returns an unsuccessful result."""
+
+    def __init__(
+        self,
+        message: object,
+        payload: Any | None = None,
+        *,
+        reason: AuthErrorReason | None = None,
+    ) -> None:
+        """Initialize a Carrier authentication exception.
+
+        Args:
+            message: Human-readable error message or raw Carrier error payload.
+            payload: Optional structured error payload from Carrier.
+            reason: Optional stable classifier for tests. Production Home
+                Assistant still treats any ``CarrierApiAuthError`` as
+                unauthorized.
+        """
+        super().__init__(message, payload=payload)
+        self.reason = reason
 
 
 class CarrierApiConnectionError(CarrierApiError, ClientError):

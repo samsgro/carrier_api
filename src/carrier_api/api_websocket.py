@@ -105,20 +105,26 @@ class ApiWebsocket:
     async def listener(self) -> None:
         """Open the websocket and dispatch incoming text messages.
 
-        The listener refreshes authentication if needed, starts the heartbeat,
-        forwards text payloads to registered callbacks, and clears connection
-        state when the socket closes.
+        The listener snapshots authentication under the token lock, starts the
+        heartbeat, forwards text payloads to registered callbacks, and clears
+        connection state when the socket closes. A committed token-generation
+        change closes the socket so Home Assistant can reconnect.
         """
-        await self.api_connection_graphql.check_auth_expiration()
+        (
+            access_token,
+            connect_generation,
+        ) = await self.api_connection_graphql.snapshot_websocket_auth()
         try:
             async with self.api_connection_graphql.api_session.ws_connect(
-                "wss://realtime.infinity.iot.carrier.com/"
-                f"?Token={self.api_connection_graphql.access_token}"
+                f"wss://realtime.infinity.iot.carrier.com/?Token={access_token}"
             ) as self.websocket:
                 if self.task_heartbeat is None:
                     await self.create_task_heartbeat()
                 if self.websocket is not None:
                     async for msg in self.websocket:
+                        if self.api_connection_graphql.ws_generation != connect_generation:
+                            await self.websocket.close()
+                            break
                         if msg.type == WSMsgType.TEXT:
                             if msg.data == "close cmd":
                                 await self.websocket.close()
@@ -149,6 +155,12 @@ class ApiWebsocket:
             if self.task_heartbeat is not None:
                 self.task_heartbeat.cancel()
             self.task_heartbeat = None
+
+    async def request_reconnect(self) -> None:
+        """Close the current websocket so the Home Assistant loop reconnects."""
+        websocket = self.websocket
+        if websocket is not None:
+            await websocket.close()
 
     async def loop_listener(self) -> None:
         """Keep reconnecting the websocket listener while running is enabled.

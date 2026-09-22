@@ -31,26 +31,26 @@ python3.14 -m venv .venv
 .venv/bin/python -m pip install carrier_api
 ```
 
-### Diagnostic fork (`3.6.0+oauthdiag.2`)
+### Diagnostic fork (`3.6.0+oauthdiag.3`)
 
-This fork adds secret-safe OAuth refresh diagnostics only. It does not change
-thermostat behavior. Token refresh reads the OAuth JSON/body before aiohttp
-`raise_for_status` can release it, so `invalid_grant` can still become
-`CarrierApiAuthError` and the raw body can still be hashed. Logs include HTTP
-status, content type, body class, body length/SHA-256, allowlisted OAuth
-`error`/`error_description`, and allowlisted request IDs. They never include
-username, password, tokens, cookies, the request body, `Authorization`,
-arbitrary headers, or the raw response body.
+This fork keeps the secret-safe OAuth refresh diagnostics from
+`oauthdiag.2` and adds an always-on token lock plus atomic `TokenPair`
+install. Two optional behaviors stay **off by default**:
 
-Install an immutable commit from the diagnostic branch:
+- `early_refresh_canary`: one diagnostic refresh 30–60 seconds after login
+- `invalid_grant_recovery`: `assistedLogin` fallback after a permanent
+  refresh rejection
 
-```bash
-python3.14 -m venv .venv
-.venv/bin/python -m pip install \
-  "carrier-api @ git+https://github.com/samsgro/carrier_api.git@8b938f201c140ca80c6530b6c8c96dd0128105d9"
-```
+A failed canary does not write tokens and does not raise into Home
+Assistant. Recovery must stay off until the live evidence table selects
+it. Logs never include username, password, tokens, cookies, the request
+body, `Authorization`, arbitrary headers, the raw response body, or the
+Okta `client_id`.
 
-Rollback to the published upstream package:
+Install from the diagnostic branch by immutable commit once `ha_carrier`
+pins the published SHA. Rollback lock-layer regressions by reinstalling
+`3.6.0+oauthdiag.2` (`af96d9514a71a6050e6642e9e12d553bf7f41c08`) or the
+published upstream package:
 
 ```bash
 .venv/bin/python -m pip install --force-reinstall "carrier-api==3.6.0"
