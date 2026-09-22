@@ -642,15 +642,17 @@ async def test_refresh_auth_token_wraps_refresh_failures(
     ("status", "payload"),
     [(401, {}), (400, {"error": "invalid_grant"})],
 )
-async def test_refresh_auth_token_treats_auth_rejections_as_auth_error(
+async def test_refresh_auth_token_recovers_from_auth_rejections(
     status: int,
     payload: object,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Raise auth errors for rejected token refresh responses.
+    """Recover from rejected refresh tokens with one assistedLogin.
 
     Args:
         status: HTTP status returned by the fake token endpoint.
         payload: JSON payload returned by the fake token endpoint.
+        monkeypatch: Pytest monkeypatch fixture.
     """
     refresh_error = ClientResponseError(
         request_info=None,  # type: ignore[arg-type]
@@ -667,11 +669,12 @@ async def test_refresh_auth_token_treats_auth_rejections_as_auth_error(
         client_session=cast("ClientSession", session),
     )
     connection.refresh_token = "old-refresh"
+    _stub_recovery_login(monkeypatch, connection)
 
-    with pytest.raises(errors.CarrierApiAuthError) as error:
-        await connection.refresh_auth_token()
+    await connection.refresh_auth_token()
 
-    assert error.value.__cause__ is refresh_error
+    assert connection.access_token == "recovered-access"
+    assert connection.refresh_token == "recovered-refresh"
 
 
 @pytest.mark.asyncio
@@ -684,11 +687,13 @@ async def test_refresh_auth_token_treats_auth_rejections_as_auth_error(
 )
 async def test_refresh_auth_token_normalizes_unreadable_error_payloads(
     json_error: TimeoutError | OSError,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Raise Carrier errors when refresh error payload reads fail.
+    """Recover from HTTP 401 even when the error body cannot be read.
 
     Args:
         json_error: Error raised while reading the refresh error response body.
+        monkeypatch: Pytest monkeypatch fixture.
     """
     refresh_error = ClientResponseError(
         request_info=None,  # type: ignore[arg-type]
@@ -709,11 +714,11 @@ async def test_refresh_auth_token_normalizes_unreadable_error_payloads(
         client_session=cast("ClientSession", session),
     )
     connection.refresh_token = "old-refresh"
+    _stub_recovery_login(monkeypatch, connection)
 
-    with pytest.raises(errors.CarrierApiAuthError) as error:
-        await connection.refresh_auth_token()
+    await connection.refresh_auth_token()
 
-    assert error.value.__cause__ is refresh_error
+    assert connection.access_token == "recovered-access"
 
 
 @pytest.mark.asyncio
@@ -853,6 +858,43 @@ def _refresh_connection(session: FakeSession) -> ApiConnectionGraphql:
     return connection
 
 
+def _recovery_login_payload() -> dict[str, Any]:
+    """Build a successful assistedLogin payload for refresh-recovery tests.
+
+    Returns:
+        GraphQL-shaped assistedLogin payload.
+    """
+    return {
+        "assistedLogin": {
+            "success": True,
+            "status": "OK",
+            "errorMessage": None,
+            "data": {
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "access_token": "recovered-access",
+                "scope": "offline_access",
+                "refresh_token": "recovered-refresh",
+            },
+        }
+    }
+
+
+def _stub_recovery_login(monkeypatch: pytest.MonkeyPatch, connection: ApiConnectionGraphql) -> None:
+    """Make assistedLogin return a valid recovery pair.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        connection: Connection under test.
+    """
+
+    async def succeed() -> dict[str, Any]:
+        """Return a successful assistedLogin payload."""
+        return _recovery_login_payload()
+
+    monkeypatch.setattr(connection, "_execute_assisted_login", succeed)
+
+
 @pytest.mark.asyncio
 async def test_refresh_auth_token_logs_safe_success_and_rotates_refresh(
     caplog: pytest.LogCaptureFixture,
@@ -886,8 +928,9 @@ async def test_refresh_auth_token_logs_safe_success_and_rotates_refresh(
 @pytest.mark.asyncio
 async def test_refresh_auth_token_logs_safe_invalid_grant_diagnostics(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Log allowlisted invalid_grant fields while raising auth rejection."""
+    """Log allowlisted invalid_grant fields, then recover through assistedLogin."""
     refresh_error = ClientResponseError(
         request_info=None,  # type: ignore[arg-type]
         history=(),
@@ -906,12 +949,12 @@ async def test_refresh_auth_token_logs_safe_invalid_grant_diagnostics(
         raw_body=b'{"error":"invalid_grant"}',
     )
     connection = _refresh_connection(session)
+    _stub_recovery_login(monkeypatch, connection)
     caplog.set_level(WARNING, logger="carrier_api.api_connection_graphql")
 
-    with pytest.raises(errors.CarrierApiAuthError) as error:
-        await connection.refresh_auth_token()
+    await connection.refresh_auth_token()
 
-    assert error.value.__cause__ is refresh_error
+    assert connection.access_token == "recovered-access"
     assert "oauth_error=invalid_grant" in caplog.text
     assert "The refresh token is invalid or expired." in caplog.text
     assert "okta-req-789" in caplog.text
@@ -954,6 +997,7 @@ async def test_refresh_auth_token_logs_other_json_error_without_changing_bucket(
 @pytest.mark.asyncio
 async def test_refresh_auth_token_logs_html_challenge_without_body(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Classify HTML challenge bodies without logging the HTML."""
     refresh_error = ClientResponseError(
@@ -972,12 +1016,12 @@ async def test_refresh_auth_token_logs_html_challenge_without_body(
         raw_body=_SECRET_HTML.encode(),
     )
     connection = _refresh_connection(session)
+    _stub_recovery_login(monkeypatch, connection)
     caplog.set_level(WARNING, logger="carrier_api.api_connection_graphql")
 
-    with pytest.raises(errors.CarrierApiAuthError) as error:
-        await connection.refresh_auth_token()
+    await connection.refresh_auth_token()
 
-    assert error.value.__cause__ is refresh_error
+    assert connection.access_token == "recovered-access"
     assert "body_class=html" in caplog.text
     assert "status=403" in caplog.text
     assert _SECRET_HTML not in caplog.text
@@ -1082,9 +1126,9 @@ async def test_refresh_auth_token_ignores_adversarial_secret_payloads(
     _assert_logs_are_secret_safe(caplog)
 
 
-def test_diagnostic_version_is_explicit() -> None:
-    """Expose an explicit local diagnostic version for the fork pin."""
-    assert VERSION == "3.6.0+oauthdiag.3"
+def test_production_fix_version_is_explicit() -> None:
+    """Expose an explicit local production-fix version for the fork pin."""
+    assert VERSION == "3.6.0+oauthfix.1"
 
 
 @pytest.mark.asyncio
@@ -1116,6 +1160,7 @@ async def test_releasing_response_body_is_unreadable_after_raise_for_status() ->
 @pytest.mark.asyncio
 async def test_refresh_auth_token_captures_invalid_grant_before_body_release(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Classify invalid_grant and hash the body even after raise_for_status."""
     refresh_error = ClientResponseError(
@@ -1137,12 +1182,12 @@ async def test_refresh_auth_token_captures_invalid_grant_before_body_release(
     )
     session.response = response  # type: ignore[assignment]
     connection = _refresh_connection(session)
+    _stub_recovery_login(monkeypatch, connection)
     caplog.set_level(WARNING, logger="carrier_api.api_connection_graphql")
 
-    with pytest.raises(errors.CarrierApiAuthError) as error:
-        await connection.refresh_auth_token()
+    await connection.refresh_auth_token()
 
-    assert error.value.__cause__ is refresh_error
+    assert connection.access_token == "recovered-access"
     assert response.raise_for_status_called
     assert response.released
     assert response.json_calls >= 1

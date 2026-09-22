@@ -31,25 +31,26 @@ python3.14 -m venv .venv
 .venv/bin/python -m pip install carrier_api
 ```
 
-### Diagnostic fork (`3.6.0+oauthdiag.3`)
+### Production fix (`3.6.0+oauthfix.1`)
 
-This fork keeps the secret-safe OAuth refresh diagnostics from
-`oauthdiag.2` and adds an always-on token lock plus atomic `TokenPair`
-install. Two optional behaviors stay **off by default**:
+This fork keeps the secret-safe OAuth refresh diagnostics and the
+always-on token lock plus atomic `TokenPair` install. Early-refresh
+canary and pre-expiry scheduling are gone. At access-token expiry the
+client attempts the refresh grant once. HTTP 400 `invalid_grant` or
+token-endpoint HTTP 401/403 suppresses that refresh token and recovers
+with up to three `assistedLogin` attempts (1s then 3s backoff). Explicit
+`assistedLogin success=false` is credential rejection. `invalid_client`
+and `unauthorized_client` never fall back to login. Three transient
+login failures raise a retryable token-refresh/connection error and do
+not start Home Assistant reauthentication.
 
-- `early_refresh_canary`: one diagnostic refresh 30–60 seconds after login
-- `invalid_grant_recovery`: `assistedLogin` fallback after a permanent
-  refresh rejection
-
-A failed canary does not write tokens and does not raise into Home
-Assistant. Recovery must stay off until the live evidence table selects
-it. Logs never include username, password, tokens, cookies, the request
+Logs never include username, password, tokens, cookies, the request
 body, `Authorization`, arbitrary headers, the raw response body, or the
 Okta `client_id`.
 
-Install from the diagnostic branch by immutable commit once `ha_carrier`
-pins the published SHA. Rollback lock-layer regressions by reinstalling
-`3.6.0+oauthdiag.2` (`af96d9514a71a6050e6642e9e12d553bf7f41c08`) or the
+Install from the production-fix branch by immutable commit once
+`ha_carrier` pins the published SHA. Rollback by reinstalling
+`3.6.0+oauthdiag.3` (`f7c22aa8ac505984653cbde3ff21ae03cd254b47`) or the
 published upstream package:
 
 ```bash

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -40,24 +40,17 @@ from .system import System
 
 _LOGGER = getLogger(__name__)
 GRAPHQL_EXECUTE_TIMEOUT_SECONDS = 60
-CANARY_DELAY_MIN = 30.0
-CANARY_DELAY_MAX = 60.0
-PRE_EXPIRY_LEAD_SECONDS = 120.0
-MAX_RECOVERY_ATTEMPTS = 2
+RECOVERY_MAX_ATTEMPTS = 3
+RECOVERY_BACKOFF_SECONDS = (1.0, 3.0)
 
 _CONNECTION_ERRORS = (GraphqlTransportError, ClientError, TimeoutError, OSError)
 _AUTH_HTTP_STATUSES = {401, 403}
 _SESSION_EVENTS = frozenset(
     {
         "login_committed",
-        "canary_scheduled",
-        "canary_skipped",
-        "canary_started",
-        "canary_finished",
         "refresh_started",
         "refresh_finished",
         "refresh_suppressed",
-        "recovery_scheduled",
         "recovery_started",
         "recovery_finished",
         "ws_reconnect_requested",
@@ -70,18 +63,16 @@ _SESSION_OUTCOMES = frozenset(
         "unauthorized",
         "invalid_client",
         "transient",
-        "skipped_ttl",
-        "skipped_flag_off",
         "cancelled",
         "login_failed",
         "login_transient",
     }
 )
 _SESSION_WS_ACTIONS = frozenset({"none", "reconnect_requested", "left_connected"})
-_SESSION_PURPOSES = frozenset({"login", "canary", "refresh", "pre_expiry", "recovery"})
-ScheduleFn = Callable[[Awaitable[None]], asyncio.Task[None]]
+_SESSION_PURPOSES = frozenset({"login", "refresh", "recovery"})
+SleepFn = Callable[[float], Awaitable[None]]
 TimeFn = Callable[[], datetime]
-TokenPairSource = Literal["login", "refresh", "canary", "recovery"]
+TokenPairSource = Literal["login", "refresh", "recovery"]
 
 
 def _is_auth_transport_error(error: BaseException) -> bool:
@@ -125,10 +116,7 @@ class TokenSessionState(StrEnum):
 
     NO_TOKENS = "NO_TOKENS"
     ACTIVE = "ACTIVE"
-    CANARY_IN_FLIGHT = "CANARY_IN_FLIGHT"
     REFRESH_IN_FLIGHT = "REFRESH_IN_FLIGHT"
-    ACTIVE_SUSPECT = "ACTIVE_SUSPECT"
-    PRE_EXPIRY_LOGIN = "PRE_EXPIRY_LOGIN"
     RECOVERY_LOGIN = "RECOVERY_LOGIN"
     AUTH_FAILED = "AUTH_FAILED"
 
@@ -174,11 +162,8 @@ class ApiConnectionGraphql:
         password: str,
         client_session: ClientSession | None = None,
         *,
-        early_refresh_canary: bool = False,
-        invalid_grant_recovery: bool = False,
-        canary_delay_seconds: float = 45.0,
-        schedule_fn: ScheduleFn | None = None,
         time_fn: TimeFn | None = None,
+        sleep_fn: SleepFn | None = None,
     ) -> None:
         """Create a Carrier GraphQL API connection.
 
@@ -187,15 +172,8 @@ class ApiConnectionGraphql:
             password: Carrier account password.
             client_session: Optional aiohttp session to reuse for token refresh
                 and websocket operations. A new session is created when omitted.
-            early_refresh_canary: When True, schedule one diagnostic refresh
-                after a successful login. Default off.
-            invalid_grant_recovery: When True, recover from a permanent refresh
-                rejection by calling assistedLogin. Default off.
-            canary_delay_seconds: Delay before the diagnostic canary. Clamped to
-                ``[30, 60]``.
-            schedule_fn: Optional Home Assistant (or test) scheduler. When
-                omitted, no background canary or pre-expiry work is started.
             time_fn: Optional clock used by token lifetime checks and tests.
+            sleep_fn: Optional sleep used by recovery backoff and tests.
         """
         self.username = username
         self.password = password
@@ -215,18 +193,9 @@ class ApiConnectionGraphql:
         self._suppressed_refresh_fp: str | None = None
         self._token_generation = 0
         self._closing = False
-        self._canary_task: asyncio.Task[None] | None = None
-        self._pre_expiry_task: asyncio.Task[None] | None = None
-        self._recovery_attempts = 0
-        self._canary_ran_for_generation: int | None = None
         self.reconnect_required = False
-        self.early_refresh_canary = early_refresh_canary
-        self.invalid_grant_recovery = invalid_grant_recovery
-        self.canary_delay_seconds = min(
-            CANARY_DELAY_MAX, max(CANARY_DELAY_MIN, canary_delay_seconds)
-        )
-        self._schedule = schedule_fn
         self._now = time_fn or (lambda: datetime.now(UTC))
+        self._sleep_fn = sleep_fn or asyncio.sleep
         self._last_session_event: str | None = None
         self._last_session_outcome: str | None = None
         self._last_refresh_fp12: str | None = None
@@ -250,8 +219,6 @@ class ApiConnectionGraphql:
         now = self._now()
         seconds_until_expiry = None if self._pair is None else self._pair.seconds_until_expiry(now)
         return {
-            "early_refresh_canary": self.early_refresh_canary,
-            "invalid_grant_recovery": self.invalid_grant_recovery,
             "state": self._state.value,
             "generation": self.ws_generation,
             "seconds_until_expiry": seconds_until_expiry,
@@ -261,16 +228,8 @@ class ApiConnectionGraphql:
         }
 
     async def cleanup(self) -> None:
-        """Cancel connection-owned OAuth tasks and close the HTTP session."""
+        """Mark the session closing and close the HTTP session."""
         self._closing = True
-        tasks = [task for task in (self._canary_task, self._pre_expiry_task) if task is not None]
-        for task in tasks:
-            task.cancel()
-        for task in tasks:
-            with suppress(asyncio.CancelledError):
-                await task
-        self._canary_task = None
-        self._pre_expiry_task = None
         try:
             await self.api_session.close()
         except (ClientError, TimeoutError, OSError) as error:
@@ -320,14 +279,14 @@ class ApiConnectionGraphql:
         """Refresh the OAuth access token using the stored refresh token.
 
         Args:
-            purpose: Why this refresh is running. ``canary`` swallows failures
-                instead of raising into Home Assistant.
+            purpose: Why this refresh is running. Production callers use
+                ``refresh``.
 
         Raises:
-            CarrierApiAuthError: If Carrier rejects the refresh token as invalid
-                or unauthorized and this is not a canary.
+            CarrierApiAuthError: If assistedLogin rejects the saved credentials
+                after a permanent refresh rejection.
             CarrierApiTokenRefreshError: If token refresh fails before Carrier
-                returns a valid OAuth response and this is not a canary.
+                returns a valid OAuth response, or recovery fails transiently.
         """
         async with self._held_token_lock():
             await self._refresh_locked(purpose=purpose)
@@ -494,14 +453,13 @@ class ApiConnectionGraphql:
         ):
             raise TypeError("expires_in must be a positive number")
         now = self._now()
-        pair_source: TokenPairSource = "recovery" if source == "pre_expiry" else source
         return TokenPair(
             access_token=access_token,
             refresh_token=refresh_token,
             token_type=token_type,
             expires_at=now + timedelta(seconds=float(expires_in)),
             obtained_at=now,
-            source=pair_source,
+            source=source,
             generation=0,
         )
 
@@ -566,19 +524,16 @@ class ApiConnectionGraphql:
         if generation is None:
             generation = self.ws_generation
         if recovery_eligible is None:
-            recovery_eligible = self.invalid_grant_recovery
+            recovery_eligible = True
         if suppressed is None:
             suppressed = self._suppressed_refresh_fp is not None
         if refresh_fp12 is not None:
             self._last_refresh_fp12 = refresh_fp12
         self._last_session_event = safe_event
         self._last_session_outcome = safe_outcome
-        if safe_outcome == "success" and safe_event not in {
-            "canary_scheduled",
-            "recovery_scheduled",
-        }:
+        if safe_outcome == "success":
             level = DEBUG
-        elif safe_event in {"canary_scheduled", "recovery_scheduled"}:
+        elif safe_event == "recovery_started":
             level = INFO
         else:
             level = WARNING
@@ -586,8 +541,7 @@ class ApiConnectionGraphql:
             level,
             "Carrier OAuth token session event=%s state=%s purpose=%s outcome=%s "
             "access_valid=%s seconds_until_expiry=%s delay_s=%s generation=%s "
-            "refresh_fp12=%s ws_action=%s canary_flag=%s recovery_flag=%s "
-            "recovery_eligible=%s suppressed=%s",
+            "refresh_fp12=%s ws_action=%s recovery_eligible=%s suppressed=%s",
             safe_event,
             self._state.value,
             safe_purpose,
@@ -598,8 +552,6 @@ class ApiConnectionGraphql:
             generation,
             refresh_fp12,
             safe_ws_action,
-            self.early_refresh_canary,
-            self.invalid_grant_recovery,
             recovery_eligible,
             suppressed,
         )
@@ -626,12 +578,8 @@ class ApiConnectionGraphql:
                     refresh_fp12=fingerprint[:12],
                     suppressed=True,
                 )
-                if self.invalid_grant_recovery and self._recovery_attempts < MAX_RECOVERY_ATTEMPTS:
-                    await self._login_locked(purpose="recovery")
-                    return
-                raise CarrierApiAuthError(
-                    "Carrier token refresh was rejected", reason="invalid_grant"
-                )
+                await self._recover_with_login_locked()
+                return
         await self.refresh_auth_token()
 
     async def _execute_assisted_login(self) -> dict[str, Any]:
@@ -679,26 +627,23 @@ class ApiConnectionGraphql:
         """Run assistedLogin and commit a validated pair while holding the lock.
 
         Args:
-            purpose: ``login``, ``recovery``, or ``pre_expiry``.
+            purpose: ``login`` or ``recovery``.
 
         Raises:
-            CarrierApiAuthError: If credentials are rejected or the payload is
-                unusable.
+            CarrierApiAuthError: If credentials are rejected. Initial login also
+                raises this when the successful payload is unusable.
             CarrierApiGraphqlError: If the GraphQL request fails.
             CarrierApiConnectionError: If the transport fails.
+            CarrierApiTokenRefreshError: If recovery receives a malformed
+                successful-token payload.
         """
-        if purpose in {"recovery", "pre_expiry"}:
-            if self._recovery_attempts >= MAX_RECOVERY_ATTEMPTS:
-                self._state = TokenSessionState.AUTH_FAILED
-                raise CarrierApiAuthError(
-                    "Carrier token refresh was rejected", reason="invalid_grant"
-                )
-            self._recovery_attempts += 1
-            self._state = (
-                TokenSessionState.PRE_EXPIRY_LOGIN
-                if purpose == "pre_expiry"
-                else TokenSessionState.RECOVERY_LOGIN
-            )
+        recovering = purpose == "recovery"
+        pair_before = self._pair
+        generation_at_request = (
+            pair_before.generation if pair_before is not None else self._token_generation
+        )
+        if recovering:
+            self._state = TokenSessionState.RECOVERY_LOGIN
             self._emit_session_log(
                 event="recovery_started",
                 purpose=purpose,
@@ -707,7 +652,7 @@ class ApiConnectionGraphql:
         try:
             result = await self._execute_assisted_login()
         except TransportQueryError as error:
-            if purpose in {"recovery", "pre_expiry"}:
+            if recovering:
                 self._emit_session_log(
                     event="recovery_finished",
                     purpose=purpose,
@@ -715,7 +660,7 @@ class ApiConnectionGraphql:
                 )
             raise CarrierApiGraphqlError("Carrier authentication GraphQL request failed") from error
         except _CONNECTION_ERRORS as error:
-            if purpose in {"recovery", "pre_expiry"}:
+            if recovering:
                 self._emit_session_log(
                     event="recovery_finished",
                     purpose=purpose,
@@ -723,7 +668,7 @@ class ApiConnectionGraphql:
                 )
             raise CarrierApiConnectionError("Carrier authentication connection failed") from error
         except GraphQLError as error:
-            if purpose in {"recovery", "pre_expiry"}:
+            if recovering:
                 self._emit_session_log(
                     event="recovery_finished",
                     purpose=purpose,
@@ -739,61 +684,92 @@ class ApiConnectionGraphql:
             else:
                 message = "Carrier assistedLogin failed"
             self._emit_session_log(
-                event="recovery_finished"
-                if purpose in {"recovery", "pre_expiry"}
-                else "login_committed",
+                event="recovery_finished" if recovering else "login_committed",
                 purpose=purpose,
                 outcome="login_failed",
             )
             raise CarrierApiAuthError(message, payload=result, reason="login_failed")
-        pair_source: TokenPairSource = (
-            "recovery" if purpose in {"recovery", "pre_expiry"} else "login"
-        )
+        pair_source: TokenPairSource = "recovery" if recovering else "login"
         try:
             pair = self._pair_from_oauth_data(result["assistedLogin"]["data"], source=pair_source)
         except (KeyError, TypeError, ValueError) as error:
+            if recovering:
+                self._emit_session_log(
+                    event="recovery_finished",
+                    purpose=purpose,
+                    outcome="login_transient",
+                )
+                raise CarrierApiTokenRefreshError(
+                    "Carrier assistedLogin returned invalid token data"
+                ) from error
             self._state = TokenSessionState.AUTH_FAILED
             raise CarrierApiAuthError(
                 "Carrier assistedLogin returned invalid token data",
                 payload=result,
                 reason="login_failed",
             ) from error
-        if self._closing:
+        if not self._commit_allowed(pair_before, generation_at_request):
             self._emit_session_log(
-                event="login_committed",
+                event="recovery_finished" if recovering else "login_committed",
                 purpose=purpose,
                 outcome="cancelled",
             )
             return
-        old_access = None if self._pair is None else self._pair.access_token
+        old_access = None if pair_before is None else pair_before.access_token
         self._install_token_pair(pair)
         self._suppressed_refresh_fp = None
-        self._recovery_attempts = 0
         if self.api_websocket is None:
             self.api_websocket = ApiWebsocket(self)
         self._maybe_request_ws_reconnect(old_access)
-        self._maybe_schedule_canary_locked()
-        finished_event = (
-            "recovery_finished" if purpose in {"recovery", "pre_expiry"} else "login_committed"
-        )
         self._emit_session_log(
-            event=finished_event,
+            event="recovery_finished" if recovering else "login_committed",
             purpose=purpose,
             outcome="success",
             refresh_fp12=self._refresh_fingerprint(pair.refresh_token)[:12],
+            suppressed=False,
         )
 
+    async def _recover_with_login_locked(self) -> None:
+        """Retry assistedLogin up to three times with 1s then 3s backoff.
+
+        Raises:
+            CarrierApiAuthError: If assistedLogin reports ``success=false``.
+            CarrierApiTokenRefreshError: If all three attempts fail transiently
+                or the session is closing.
+        """
+        generation_before = self.ws_generation
+        last_error: BaseException | None = None
+        for attempt in range(1, RECOVERY_MAX_ATTEMPTS + 1):
+            if self._closing:
+                raise CarrierApiTokenRefreshError("Carrier token session is closing")
+            try:
+                await self._login_locked(purpose="recovery")
+            except CarrierApiAuthError:
+                raise
+            except (CarrierApiConnectionError, CarrierApiGraphqlError) as error:
+                last_error = error
+                if attempt >= RECOVERY_MAX_ATTEMPTS:
+                    break
+                delay = RECOVERY_BACKOFF_SECONDS[attempt - 1]
+                await self._sleep_fn(delay)
+                continue
+            if self.ws_generation != generation_before:
+                return
+            if self._closing:
+                raise CarrierApiTokenRefreshError("Carrier token session is closing")
+            return
+        raise CarrierApiTokenRefreshError("Carrier assistedLogin recovery failed") from last_error
+
     async def _refresh_locked(self, *, purpose: str) -> None:
-        """Refresh or canary-refresh while holding the token lock.
+        """Refresh the stored grant once, then recover on permanent rejection.
 
         Args:
-            purpose: ``refresh`` or ``canary``.
+            purpose: ``refresh`` in production. Other values are logged as
+                refresh if they are not allowlisted.
         """
-        event_started = "canary_started" if purpose == "canary" else "refresh_started"
-        event_finished = "canary_finished" if purpose == "canary" else "refresh_finished"
         if self._closing:
             self._emit_session_log(
-                event=event_finished,
+                event="refresh_finished",
                 purpose=purpose,
                 outcome="cancelled",
             )
@@ -813,20 +789,12 @@ class ApiConnectionGraphql:
                 refresh_fp12=fingerprint[:12],
                 suppressed=True,
             )
-            if purpose == "canary":
-                return
-            if self.invalid_grant_recovery and self._recovery_attempts < MAX_RECOVERY_ATTEMPTS:
-                await self._login_locked(purpose="recovery")
-                return
-            raise CarrierApiAuthError("Carrier token refresh was rejected", reason="invalid_grant")
+            await self._recover_with_login_locked()
+            return
         access_valid = self._seconds_until_expiry(self._now()) > 0
-        self._state = (
-            TokenSessionState.CANARY_IN_FLIGHT
-            if purpose == "canary"
-            else TokenSessionState.REFRESH_IN_FLIGHT
-        )
+        self._state = TokenSessionState.REFRESH_IN_FLIGHT
         self._emit_session_log(
-            event=event_started,
+            event="refresh_started",
             purpose=purpose,
             outcome="success",
             access_valid=access_valid,
@@ -848,12 +816,11 @@ class ApiConnectionGraphql:
             response.raise_for_status()
             if parse_error is not None:
                 raise parse_error
-            pair_source: TokenPairSource = "canary" if purpose == "canary" else "refresh"
-            new_pair = self._pair_from_oauth_data(parsed, source=pair_source)
+            new_pair = self._pair_from_oauth_data(parsed, source="refresh")
         except asyncio.CancelledError:
             self._state = TokenSessionState.ACTIVE if access_valid else self._state
             self._emit_session_log(
-                event=event_finished,
+                event="refresh_finished",
                 purpose=purpose,
                 outcome="cancelled",
                 access_valid=access_valid,
@@ -869,13 +836,10 @@ class ApiConnectionGraphql:
                 level=WARNING,
             )
             kind = self._oauth_error_kind(error, parsed)
-            if purpose == "canary":
-                self._handle_canary_failure(kind, fingerprint)
-                return
             if kind == "invalid_client":
                 self._state = TokenSessionState.ACTIVE if access_valid else self._state
                 self._emit_session_log(
-                    event=event_finished,
+                    event="refresh_finished",
                     purpose=purpose,
                     outcome="invalid_client",
                     access_valid=access_valid,
@@ -885,40 +849,20 @@ class ApiConnectionGraphql:
                 raise CarrierApiTokenRefreshError("Carrier token refresh failed") from error
             if kind in {"invalid_grant", "unauthorized"}:
                 self._suppressed_refresh_fp = fingerprint
-                if access_valid:
-                    self._state = TokenSessionState.ACTIVE_SUSPECT
-                    self._maybe_schedule_pre_expiry_locked()
-                    if purpose != "refresh":
-                        self._emit_session_log(
-                            event=event_finished,
-                            purpose=purpose,
-                            outcome=kind,
-                            access_valid=True,
-                            ws_action="left_connected",
-                            refresh_fp12=fingerprint[:12],
-                        )
-                        return
-                if self.invalid_grant_recovery and self._recovery_attempts < MAX_RECOVERY_ATTEMPTS:
-                    await self._login_locked(purpose="recovery")
-                    return
-                self._state = TokenSessionState.AUTH_FAILED
                 self._emit_session_log(
-                    event=event_finished,
+                    event="refresh_finished",
                     purpose=purpose,
                     outcome=kind,
                     access_valid=access_valid,
+                    ws_action="left_connected",
                     refresh_fp12=fingerprint[:12],
                     suppressed=True,
                 )
-                auth_reason: Literal["invalid_grant", "unauthorized"] = (
-                    "invalid_grant" if kind == "invalid_grant" else "unauthorized"
-                )
-                raise CarrierApiAuthError(
-                    "Carrier token refresh was rejected", reason=auth_reason
-                ) from error
+                await self._recover_with_login_locked()
+                return
             self._state = TokenSessionState.ACTIVE if access_valid else self._state
             self._emit_session_log(
-                event=event_finished,
+                event="refresh_finished",
                 purpose=purpose,
                 outcome="transient",
                 access_valid=access_valid,
@@ -933,20 +877,9 @@ class ApiConnectionGraphql:
                 raw_body=raw_body,
                 level=WARNING,
             )
-            if purpose == "canary":
-                self._state = TokenSessionState.ACTIVE
-                self._emit_session_log(
-                    event=event_finished,
-                    purpose=purpose,
-                    outcome="transient",
-                    access_valid=True,
-                    ws_action="left_connected",
-                    refresh_fp12=fingerprint[:12],
-                )
-                return
             self._state = TokenSessionState.ACTIVE if access_valid else self._state
             self._emit_session_log(
-                event=event_finished,
+                event="refresh_finished",
                 purpose=purpose,
                 outcome="transient",
                 access_valid=access_valid,
@@ -956,7 +889,7 @@ class ApiConnectionGraphql:
         if not self._commit_allowed(pair, generation_at_request):
             self._state = TokenSessionState.ACTIVE if access_valid else self._state
             self._emit_session_log(
-                event=event_finished,
+                event="refresh_finished",
                 purpose=purpose,
                 outcome="cancelled",
                 access_valid=access_valid,
@@ -977,7 +910,7 @@ class ApiConnectionGraphql:
         )
         ws_action = "reconnect_requested" if self.reconnect_required else "none"
         self._emit_session_log(
-            event=event_finished,
+            event="refresh_finished",
             purpose=purpose,
             outcome="success",
             access_valid=True,
@@ -985,159 +918,6 @@ class ApiConnectionGraphql:
             refresh_fp12=self._refresh_fingerprint(new_pair.refresh_token)[:12],
             suppressed=False,
         )
-
-    def _handle_canary_failure(self, kind: str, fingerprint: str) -> None:
-        """Restore state after a failed canary without writing token fields.
-
-        Args:
-            kind: Classified OAuth error kind.
-            fingerprint: Refresh-token fingerprint from the request generation.
-        """
-        if kind in {"invalid_grant", "unauthorized"}:
-            self._suppressed_refresh_fp = fingerprint
-            self._state = TokenSessionState.ACTIVE_SUSPECT
-            self._maybe_schedule_pre_expiry_locked()
-            self._emit_session_log(
-                event="canary_finished",
-                purpose="canary",
-                outcome=kind,
-                access_valid=True,
-                ws_action="left_connected",
-                recovery_eligible=self.invalid_grant_recovery,
-                refresh_fp12=fingerprint[:12],
-                suppressed=True,
-            )
-            return
-        if kind == "invalid_client":
-            self._state = TokenSessionState.ACTIVE
-            self._emit_session_log(
-                event="canary_finished",
-                purpose="canary",
-                outcome="invalid_client",
-                access_valid=True,
-                ws_action="left_connected",
-                recovery_eligible=False,
-                refresh_fp12=fingerprint[:12],
-            )
-            return
-        self._state = TokenSessionState.ACTIVE
-        self._emit_session_log(
-            event="canary_finished",
-            purpose="canary",
-            outcome="transient",
-            access_valid=True,
-            ws_action="left_connected",
-            refresh_fp12=fingerprint[:12],
-        )
-
-    def _maybe_schedule_canary_locked(self) -> None:
-        """Schedule one diagnostic canary for the current login generation."""
-        if not self.early_refresh_canary or self._schedule is None or self._pair is None:
-            return
-        if self._canary_ran_for_generation == self._pair.generation:
-            return
-        ttl = self._pair.seconds_until_expiry(self._now())
-        if ttl <= self.canary_delay_seconds + PRE_EXPIRY_LEAD_SECONDS:
-            self._emit_session_log(
-                event="canary_skipped",
-                purpose="canary",
-                outcome="skipped_ttl",
-                delay_s=self.canary_delay_seconds,
-            )
-            return
-        self._canary_ran_for_generation = self._pair.generation
-        self._canary_task = self._schedule(self._run_canary())
-        self._emit_session_log(
-            event="canary_scheduled",
-            purpose="canary",
-            outcome="success",
-            delay_s=self.canary_delay_seconds,
-        )
-
-    async def _run_canary(self) -> None:
-        """Sleep outside the lock, then run one canary refresh."""
-        try:
-            await asyncio.sleep(self.canary_delay_seconds)
-            if self._closing:
-                self._emit_session_log(
-                    event="canary_finished",
-                    purpose="canary",
-                    outcome="cancelled",
-                )
-                return
-            await self.refresh_auth_token(purpose="canary")
-        except asyncio.CancelledError:
-            self._emit_session_log(
-                event="canary_finished",
-                purpose="canary",
-                outcome="cancelled",
-            )
-            raise
-        except (
-            CarrierApiAuthError,
-            CarrierApiTokenRefreshError,
-            CarrierApiConnectionError,
-            CarrierApiGraphqlError,
-        ):
-            self._emit_session_log(
-                event="canary_finished",
-                purpose="canary",
-                outcome="transient",
-                access_valid=True,
-                ws_action="left_connected",
-            )
-
-    def _maybe_schedule_pre_expiry_locked(self) -> None:
-        """Schedule a pre-expiry recovery login when recovery is enabled."""
-        if not self.invalid_grant_recovery or self._schedule is None or self._pair is None:
-            return
-        ttl = self._pair.seconds_until_expiry(self._now())
-        if ttl <= 0:
-            return
-        delay = max(0.0, ttl - PRE_EXPIRY_LEAD_SECONDS)
-        self._pre_expiry_task = self._schedule(self._run_pre_expiry_login(delay))
-        self._emit_session_log(
-            event="recovery_scheduled",
-            purpose="pre_expiry",
-            outcome="success",
-            delay_s=delay,
-            recovery_eligible=True,
-        )
-
-    async def _run_pre_expiry_login(self, delay: float) -> None:
-        """Sleep until the pre-expiry window, then login if still suspect.
-
-        Args:
-            delay: Seconds to wait outside the lock.
-        """
-        try:
-            await asyncio.sleep(delay)
-            if self._closing:
-                self._emit_session_log(
-                    event="recovery_finished",
-                    purpose="pre_expiry",
-                    outcome="cancelled",
-                )
-                return
-            async with self._held_token_lock():
-                if self._state is not TokenSessionState.ACTIVE_SUSPECT:
-                    return
-                await self._login_locked(purpose="pre_expiry")
-            await self._close_websocket_if_reconnect_required()
-        except asyncio.CancelledError:
-            self._emit_session_log(
-                event="recovery_finished",
-                purpose="pre_expiry",
-                outcome="cancelled",
-            )
-            raise
-        except (
-            CarrierApiAuthError,
-            CarrierApiTokenRefreshError,
-            CarrierApiConnectionError,
-            CarrierApiGraphqlError,
-        ):
-            return
 
     async def authed_query(
         self, operation_name: str, query: GraphQLRequest, variable_values: dict[str, Any]
