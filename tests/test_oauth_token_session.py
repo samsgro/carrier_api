@@ -8,6 +8,7 @@ from logging import INFO, WARNING
 from typing import Any, Self, cast
 
 from aiohttp import ClientConnectionError, ClientResponseError, ClientSession
+from gql.transport.exceptions import TransportServerError
 import pytest
 
 from carrier_api.api_connection_graphql import ApiConnectionGraphql, TokenPair, TokenSessionState
@@ -19,6 +20,7 @@ from .test_api_connection_graphql import (
     _SECRET_COOKIE,
     _SECRET_NEW_REFRESH_TOKEN,
     _SECRET_PASSWORD,
+    _SECRET_REFRESH_TOKEN,
     _SECRET_USERNAME,
     FakeResponse,
     FakeSession,
@@ -295,6 +297,126 @@ class ScriptedLogin:
         if isinstance(result, BaseException):
             raise result
         return result
+
+
+def _scripted_graphql_client(
+    *items: dict[str, Any] | BaseException,
+) -> tuple[type[object], list[str]]:
+    """Build a GraphQL Client double that yields scripted execute results.
+
+    Args:
+        items: Payloads or exceptions consumed in order across Client instances.
+
+    Returns:
+        The client class and the list of operation names that were executed.
+    """
+    queued = list(items)
+    operations: list[str] = []
+
+    class ScriptedGraphQLClient:
+        """GraphQL client that pops scripted execute results."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            """Accept GraphQL client construction arguments."""
+
+        async def __aenter__(self) -> Self:
+            """Enter the fake session."""
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            """Exit the fake session."""
+
+        async def execute(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            """Return or raise the next scripted GraphQL result.
+
+            Returns:
+                Next scripted payload.
+
+            Raises:
+                BaseException: The next scripted execute failure.
+                AssertionError: If more executes are requested than scripted.
+            """
+            operations.append(str(kwargs.get("operation_name", "")))
+            if not queued:
+                raise AssertionError("unexpected extra GraphQL execute")
+            item = queued.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+    return ScriptedGraphQLClient, operations
+
+
+def _generation_aware_graphql_client(
+    *,
+    rejected_header: str,
+    first_wave: int = 1,
+) -> tuple[type[object], dict[str, Any]]:
+    """Build a Client double that 401s the rejected header, then succeeds.
+
+    Args:
+        rejected_header: Authorization value that should raise HTTP 401.
+        first_wave: Concurrent first-wave executes that must all 401 together.
+
+    Returns:
+        The client class and a mutable execute-statistics mapping.
+    """
+    stats: dict[str, Any] = {
+        "executes": 0,
+        "rejected": 0,
+        "successes": 0,
+        "operations": [],
+    }
+    barrier = asyncio.Barrier(first_wave) if first_wave > 1 else None
+
+    class GenerationAwareGraphQLClient:
+        """GraphQL client that rejects one Authorization header generation."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            """Capture the Authorization header from the constructed transport."""
+            transport = kwargs.get("transport")
+            headers = getattr(transport, "headers", None) or {}
+            self._authorization = headers.get("Authorization")
+
+        async def __aenter__(self) -> Self:
+            """Enter the fake session."""
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            """Exit the fake session."""
+
+        async def execute(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            """Reject the stale header or return a successful payload.
+
+            Returns:
+                A dummy GraphQL success payload.
+
+            Raises:
+                TransportServerError: When the captured header is still rejected.
+            """
+            stats["executes"] += 1
+            stats["operations"].append(str(kwargs.get("operation_name", "")))
+            if self._authorization == rejected_header:
+                if barrier is not None:
+                    await barrier.wait()
+                stats["rejected"] += 1
+                raise TransportServerError("unauthorized", code=401)
+            stats["successes"] += 1
+            return {"ok": True}
+
+    return GenerationAwareGraphQLClient, stats
+
+
+def _auth_transport_error(status: int) -> TransportServerError:
+    """Build a GraphQL transport auth rejection.
+
+    Args:
+        status: HTTP status to expose.
+
+    Returns:
+        gql transport server error.
+    """
+    return TransportServerError("unauthorized", code=status)
 
 
 @pytest.mark.asyncio
@@ -938,3 +1060,283 @@ async def test_unexpired_check_does_not_refresh() -> None:
 
     assert session.posts == []
     assert connection.access_token == _LOGIN_ACCESS
+
+
+async def _authed_query(connection: ApiConnectionGraphql) -> dict[str, Any]:
+    """Run a dummy authenticated GraphQL operation.
+
+    Args:
+        connection: Connection under test.
+
+    Returns:
+        Decoded GraphQL payload from the scripted client.
+    """
+    return await connection.authed_query(
+        operation_name="getUser",
+        query=cast("Any", object()),
+        variable_values={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_unexpired_graphql_401_recovers_once_and_retries_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpired pair + GraphQL 401 recovers once, retries, and does not POST."""
+    session = CountingSession()
+    connection = _connection(session)
+    original = _install_pair(connection)
+    client, operations = _scripted_graphql_client(
+        _auth_transport_error(401),
+        {"user": {"ok": True}},
+    )
+    login = ScriptedLogin(
+        _login_payload(access_token="recovered-access", refresh_token="recovered-refresh")
+    )
+    monkeypatch.setattr("carrier_api.api_connection_graphql.Client", client)
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+
+    result = await _authed_query(connection)
+
+    assert result == {"user": {"ok": True}}
+    assert login.calls == 1
+    assert session.posts == []
+    assert operations == ["getUser", "getUser"]
+    assert connection.access_token == "recovered-access"
+    assert connection.ws_generation == original.generation + 1
+    assert connection._rejected_generation is None
+    assert connection._state is TokenSessionState.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_unexpired_graphql_403_recovers_once_and_retries_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpired pair + GraphQL 403 recovers once, retries, and does not POST."""
+    session = CountingSession()
+    connection = _connection(session)
+    original = _install_pair(connection)
+    client, operations = _scripted_graphql_client(
+        _auth_transport_error(403),
+        {"user": {"ok": True}},
+    )
+    login = ScriptedLogin(
+        _login_payload(access_token="recovered-access", refresh_token="recovered-refresh")
+    )
+    monkeypatch.setattr("carrier_api.api_connection_graphql.Client", client)
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+
+    result = await _authed_query(connection)
+
+    assert result == {"user": {"ok": True}}
+    assert login.calls == 1
+    assert session.posts == []
+    assert operations == ["getUser", "getUser"]
+    assert connection.ws_generation == original.generation + 1
+
+
+@pytest.mark.asyncio
+async def test_graphql_401_after_successful_recovery_raises_without_second_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 401 on the recovered generation raises access_rejected once."""
+    session = CountingSession()
+    connection = _connection(session)
+    original = _install_pair(connection)
+    retry_error = _auth_transport_error(401)
+    client, _operations = _scripted_graphql_client(_auth_transport_error(401), retry_error)
+    login = ScriptedLogin(
+        _login_payload(access_token="recovered-access", refresh_token="recovered-refresh")
+    )
+    monkeypatch.setattr("carrier_api.api_connection_graphql.Client", client)
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+
+    with pytest.raises(CarrierApiAuthError) as error:
+        await _authed_query(connection)
+
+    assert error.value.reason == "access_rejected"
+    assert error.value.__cause__ is retry_error
+    assert login.calls == 1
+    assert session.posts == []
+    assert connection.ws_generation == original.generation + 1
+    assert connection.access_token == "recovered-access"
+
+
+@pytest.mark.asyncio
+async def test_graphql_401_login_success_false_sets_auth_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AssistedLogin success=false after GraphQL 401 sets AUTH_FAILED."""
+    session = CountingSession()
+    connection = _connection(session)
+    original = _install_pair(connection)
+    client, _operations = _scripted_graphql_client(_auth_transport_error(401))
+    login = ScriptedLogin(_login_payload(success=False, error_message="bad password"))
+    monkeypatch.setattr("carrier_api.api_connection_graphql.Client", client)
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+
+    with pytest.raises(CarrierApiAuthError) as error:
+        await _authed_query(connection)
+
+    assert error.value.reason == "login_failed"
+    assert login.calls == 1
+    assert session.posts == []
+    assert connection._pair is original
+    assert connection.access_token == _LOGIN_ACCESS
+    assert connection._state is TokenSessionState.AUTH_FAILED
+    assert connection._rejected_generation == original.generation
+
+
+@pytest.mark.asyncio
+async def test_graphql_401_three_transient_logins_raise_token_refresh_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three transient assistedLogin failures stay a retryable refresh error."""
+    session = CountingSession()
+    sleep = RecordingSleep()
+    connection = _connection(session, sleep=sleep)
+    original = _install_pair(connection)
+    client, _operations = _scripted_graphql_client(_auth_transport_error(401))
+    login = ScriptedLogin(
+        ClientConnectionError("login 1"),
+        ClientConnectionError("login 2"),
+        ClientConnectionError("login 3"),
+    )
+    monkeypatch.setattr("carrier_api.api_connection_graphql.Client", client)
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+
+    with pytest.raises(CarrierApiTokenRefreshError) as error:
+        await _authed_query(connection)
+
+    assert not isinstance(error.value, CarrierApiAuthError)
+    assert login.calls == 3
+    assert sleep.delays == [1.0, 3.0]
+    assert session.posts == []
+    assert connection._pair is original
+    assert connection._state is TokenSessionState.RECOVERY_PENDING
+
+
+@pytest.mark.asyncio
+async def test_concurrent_authed_query_401s_share_one_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N concurrent 401s on one generation share a single assistedLogin."""
+    session = CountingSession()
+    connection = _connection(session)
+    original = _install_pair(connection)
+    rejected_header = original.authorization()
+    client, stats = _generation_aware_graphql_client(
+        rejected_header=rejected_header,
+        first_wave=3,
+    )
+    login = ScriptedLogin(
+        _login_payload(access_token="recovered-access", refresh_token="recovered-refresh")
+    )
+    monkeypatch.setattr("carrier_api.api_connection_graphql.Client", client)
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+
+    results = await asyncio.gather(
+        _authed_query(connection),
+        _authed_query(connection),
+        _authed_query(connection),
+    )
+
+    assert results == [{"ok": True}, {"ok": True}, {"ok": True}]
+    assert login.calls == 1
+    assert session.posts == []
+    assert stats["rejected"] == 3
+    assert stats["successes"] == 3
+    assert connection.ws_generation == original.generation + 1
+    assert connection.access_token == "recovered-access"
+
+
+@pytest.mark.asyncio
+async def test_caller_arriving_after_newer_generation_retries_without_recovering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late 401 handler for an old generation does not recover again."""
+    session = CountingSession()
+    connection = _connection(session)
+    original = _install_pair(connection)
+    client, operations = _scripted_graphql_client(
+        _auth_transport_error(401),
+        {"user": {"ok": True}},
+    )
+    login = ScriptedLogin(
+        _login_payload(access_token="recovered-access", refresh_token="recovered-refresh")
+    )
+    monkeypatch.setattr("carrier_api.api_connection_graphql.Client", client)
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+
+    result = await _authed_query(connection)
+    await connection._recover_access_rejection_locked(
+        generation_used=original.generation,
+        operation="getUser",
+    )
+
+    assert result == {"user": {"ok": True}}
+    assert login.calls == 1
+    assert operations == ["getUser", "getUser"]
+    assert connection.ws_generation == original.generation + 1
+
+
+@pytest.mark.asyncio
+async def test_access_rejection_logs_are_warning_and_secret_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Access-rejection recovery logs are WARNING, named, and secret-safe."""
+    session = CountingSession()
+    connection = _connection(session)
+    original = _install_pair(
+        connection,
+        access_token=_SECRET_ACCESS_TOKEN,
+        refresh_token=_SECRET_REFRESH_TOKEN,
+    )
+    client, _operations = _scripted_graphql_client(
+        _auth_transport_error(401),
+        {"user": {"ok": True}},
+    )
+    login = ScriptedLogin(
+        _login_payload(access_token="recovered-access", refresh_token="recovered-refresh")
+    )
+    monkeypatch.setattr("carrier_api.api_connection_graphql.Client", client)
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+    caplog.set_level(WARNING, logger="carrier_api.api_connection_graphql")
+
+    await _authed_query(connection)
+
+    warning_text = "\n".join(
+        record.getMessage() for record in caplog.records if record.levelno == WARNING
+    )
+    assert "event=access_rejected" in warning_text
+    assert "event=recovery_started" in warning_text
+    assert "event=recovery_finished" in warning_text
+    assert "operation=getUser" in warning_text
+    assert f"generation={original.generation}" in warning_text
+    assert "seconds_until_expiry=" in warning_text
+    _assert_logs_are_secret_safe(caplog)
+
+
+@pytest.mark.asyncio
+async def test_rejected_generation_not_returned_by_ensure_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """check_auth_expiration recovers a marked-rejected pair instead of returning it."""
+    session = CountingSession()
+    connection = _connection(session)
+    original = _install_pair(connection)
+    login = ScriptedLogin(
+        _login_payload(access_token="recovered-access", refresh_token="recovered-refresh")
+    )
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+    connection._mark_access_rejected_locked(generation=original.generation, operation="getUser")
+
+    header = await connection.check_auth_expiration()
+
+    assert header == "Bearer recovered-access"
+    assert login.calls == 1
+    assert session.posts == []
+    assert connection.access_token == "recovered-access"
+    assert connection._rejected_generation is None
+    assert connection.ws_generation == original.generation + 1

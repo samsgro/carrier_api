@@ -49,6 +49,7 @@ class ApiWebsocket:
         self.async_callbacks: list[AsyncCallback] = []
         self.task_heartbeat: Task[None] | None = None
         self.task_listener: Task[None] | None = None
+        self.last_close_code: int | None = None
         self.api_connection_graphql = api_connection_graphql
         self.api_connection_graphql.api_websocket = self
 
@@ -151,6 +152,9 @@ class ApiWebsocket:
         except (ClientError, TimeoutError, OSError) as error:
             raise CarrierApiWebsocketError("Carrier websocket connection failed") from error
         finally:
+            self.last_close_code = (
+                None if self.websocket is None else getattr(self.websocket, "close_code", None)
+            )
             self.websocket = None
             if self.task_heartbeat is not None:
                 self.task_heartbeat.cancel()

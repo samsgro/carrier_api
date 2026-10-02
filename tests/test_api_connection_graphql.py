@@ -278,16 +278,20 @@ def graphql_client_double(
     *,
     result: dict[str, Any] | None = None,
     error: BaseException | None = None,
+    results: list[dict[str, Any] | BaseException] | None = None,
 ) -> type[object]:
     """Create a GraphQL client double that returns or raises during execute.
 
     Args:
         result: Optional GraphQL result returned by ``execute``.
         error: Optional error raised by ``execute``.
+        results: Optional ordered payloads or exceptions consumed across
+            ``Client`` instances so ``authed_query`` can 401 then retry.
 
     Returns:
         A GraphQL client double class suitable for monkeypatching ``Client``.
     """
+    queued = None if results is None else list(results)
 
     class ConfiguredGraphQLClient:
         """GraphQL client double with configured execute behavior."""
@@ -313,8 +317,17 @@ def graphql_client_double(
                 The configured GraphQL result.
 
             Raises:
-                BaseException: When ``error`` is configured.
+                BaseException: When ``error`` or the next ``results`` item is
+                    an exception.
+                AssertionError: If more executes are requested than scripted.
             """
+            if queued is not None:
+                if not queued:
+                    raise AssertionError("unexpected extra GraphQL execute")
+                item = queued.pop(0)
+                if isinstance(item, BaseException):
+                    raise item
+                return item
             if error is not None:
                 raise error
             assert result is not None
@@ -1150,7 +1163,7 @@ async def test_refresh_auth_token_ignores_adversarial_secret_payloads(
 
 def test_production_fix_version_is_explicit() -> None:
     """Expose an explicit local production-fix version for the fork pin."""
-    assert VERSION == "3.6.0+oauthfix.1"
+    assert VERSION == "3.6.0+oauthfix.2"
 
 
 @pytest.mark.asyncio
@@ -1418,16 +1431,24 @@ async def test_authed_query_maps_auth_transport_errors_to_auth_error(
     monkeypatch: pytest.MonkeyPatch,
     status: int,
 ) -> None:
-    """Raise auth errors when GraphQL transport reports auth HTTP statuses.
+    """Recover once from GraphQL 401/403 on an unexpired token, then succeed.
 
     Args:
         monkeypatch: Pytest helper for replacing the GraphQL client.
         status: HTTP status raised by the fake GraphQL transport.
     """
     transport_error = TransportServerError("unauthorized", code=status)
+    success = {"user": {"username": "user@example.com"}}
+    login_calls = {"n": 0}
+
+    async def succeed_login() -> dict[str, Any]:
+        """Return a successful assistedLogin payload and count the call."""
+        login_calls["n"] += 1
+        return _recovery_login_payload()
 
     monkeypatch.setattr(
-        "carrier_api.api_connection_graphql.Client", graphql_client_double(error=transport_error)
+        "carrier_api.api_connection_graphql.Client",
+        graphql_client_double(results=[transport_error, success]),
     )
     connection = ApiConnectionGraphql(
         username="user@example.com",
@@ -1438,6 +1459,46 @@ async def test_authed_query_maps_auth_transport_errors_to_auth_error(
     connection.token_type = "Bearer"
     connection.access_token = "access"
     connection.expires_at = datetime.now(UTC) + timedelta(hours=1)
+    monkeypatch.setattr(connection, "_execute_assisted_login", succeed_login)
+
+    result = await connection.authed_query(
+        operation_name="getUser",
+        query=cast("GraphQLRequest", object()),
+        variable_values={},
+    )
+
+    assert result == success
+    assert login_calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_authed_query_persisted_401_after_recovery_is_access_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 401 after successful recovery raises access_rejected without a second login."""
+    first_error = TransportServerError("unauthorized", code=401)
+    retry_error = TransportServerError("still unauthorized", code=401)
+    login_calls = {"n": 0}
+
+    async def succeed_login() -> dict[str, Any]:
+        """Return a successful assistedLogin payload and count the call."""
+        login_calls["n"] += 1
+        return _recovery_login_payload()
+
+    monkeypatch.setattr(
+        "carrier_api.api_connection_graphql.Client",
+        graphql_client_double(results=[first_error, retry_error]),
+    )
+    connection = ApiConnectionGraphql(
+        username="user@example.com",
+        password="password",
+        client_session=cast("ClientSession", FakeSession()),
+    )
+    connection.refresh_token = "refresh"
+    connection.token_type = "Bearer"
+    connection.access_token = "access"
+    connection.expires_at = datetime.now(UTC) + timedelta(hours=1)
+    monkeypatch.setattr(connection, "_execute_assisted_login", succeed_login)
 
     with pytest.raises(errors.CarrierApiAuthError) as error:
         await connection.authed_query(
@@ -1446,7 +1507,9 @@ async def test_authed_query_maps_auth_transport_errors_to_auth_error(
             variable_values={},
         )
 
-    assert error.value.__cause__ is transport_error
+    assert error.value.reason == "access_rejected"
+    assert error.value.__cause__ is retry_error
+    assert login_calls["n"] == 1
 
 
 @pytest.mark.asyncio

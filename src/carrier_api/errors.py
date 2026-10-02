@@ -4,7 +4,7 @@ from typing import Any, Literal
 
 from aiohttp import ClientError
 
-AuthErrorReason = Literal["invalid_grant", "unauthorized", "login_failed"]
+AuthErrorReason = Literal["invalid_grant", "unauthorized", "login_failed", "access_rejected"]
 
 
 class CarrierApiError(Exception):

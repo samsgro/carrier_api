@@ -56,6 +56,8 @@ _SESSION_EVENTS = frozenset(
         "recovery_attempt",
         "recovery_backoff",
         "ws_reconnect_requested",
+        "access_rejected",
+        "reauth_escalation",
     }
 )
 _SESSION_OUTCOMES = frozenset(
@@ -69,6 +71,8 @@ _SESSION_OUTCOMES = frozenset(
         "login_failed",
         "login_transient",
         "exhausted",
+        "access_rejected",
+        "persisted_after_recovery",
     }
 )
 _SESSION_WS_ACTIONS = frozenset({"none", "reconnect_requested", "left_connected"})
@@ -196,6 +200,7 @@ class ApiConnectionGraphql:
         self._state = TokenSessionState.NO_TOKENS
         self._suppressed_refresh_fp: str | None = None
         self._token_generation = 0
+        self._rejected_generation: int | None = None
         self._closing = False
         self.reconnect_required = False
         self._now = time_fn or (lambda: datetime.now(UTC))
@@ -213,6 +218,15 @@ class ApiConnectionGraphql:
         """
         return 0 if self._pair is None else self._pair.generation
 
+    @property
+    def session_closing(self) -> bool:
+        """Return whether cleanup has started and new token work should stop.
+
+        Returns:
+            ``True`` after ``cleanup`` marks the session closing.
+        """
+        return self._closing
+
     def token_session_diagnostics(self) -> dict[str, Any]:
         """Return a redacted token-session snapshot for Home Assistant diagnostics.
 
@@ -225,6 +239,7 @@ class ApiConnectionGraphql:
         return {
             "state": self._state.value,
             "generation": self.ws_generation,
+            "rejected_generation": self._rejected_generation,
             "seconds_until_expiry": seconds_until_expiry,
             "last_event": self._last_session_event,
             "last_outcome": self._last_session_outcome,
@@ -395,6 +410,7 @@ class ApiConnectionGraphql:
         self.token_type = installed.token_type
         self.expires_at = installed.expires_at
         self._state = TokenSessionState.ACTIVE
+        self._rejected_generation = None
 
     def _maybe_request_ws_reconnect(self, old_access: str | None) -> None:
         """Mark a websocket reconnect when a committed access token changed.
@@ -502,6 +518,7 @@ class ApiConnectionGraphql:
         recovery_eligible: bool | None = None,
         suppressed: bool | None = None,
         attempt: int | None = None,
+        operation: str | None = None,
     ) -> None:
         """Emit one allowlisted token-session orchestration log line.
 
@@ -518,6 +535,7 @@ class ApiConnectionGraphql:
             recovery_eligible: Whether recovery may run for this outcome.
             suppressed: Whether this refresh fingerprint is suppressed.
             attempt: Recovery attempt number when relevant.
+            operation: GraphQL operation name when an access token was rejected.
         """
         safe_event = event if event in _SESSION_EVENTS else "refresh_finished"
         safe_purpose = purpose if purpose in _SESSION_PURPOSES else "refresh"
@@ -538,7 +556,14 @@ class ApiConnectionGraphql:
             self._last_refresh_fp12 = refresh_fp12
         self._last_session_event = safe_event
         self._last_session_outcome = safe_outcome
-        if safe_event in {"recovery_started", "recovery_attempt"}:
+        if safe_event in {
+            "access_rejected",
+            "recovery_started",
+            "recovery_finished",
+            "reauth_escalation",
+        }:
+            level = WARNING
+        elif safe_event == "recovery_attempt":
             level = INFO
         elif safe_outcome == "success":
             level = DEBUG
@@ -549,7 +574,7 @@ class ApiConnectionGraphql:
             "Carrier OAuth token session event=%s state=%s purpose=%s outcome=%s "
             "access_valid=%s seconds_until_expiry=%s delay_s=%s generation=%s "
             "refresh_fp12=%s ws_action=%s recovery_eligible=%s suppressed=%s "
-            "attempt=%s",
+            "attempt=%s operation=%s",
             safe_event,
             self._state.value,
             safe_purpose,
@@ -563,7 +588,80 @@ class ApiConnectionGraphql:
             recovery_eligible,
             suppressed,
             attempt_label,
+            operation,
         )
+
+    def _mark_access_rejected_locked(self, *, generation: int, operation: str) -> None:
+        """Mark the published pair rejected and emit a WARNING session event.
+
+        Args:
+            generation: Token generation that received GraphQL 401/403.
+            operation: GraphQL operation name that was rejected.
+        """
+        if self._pair is not None and self._pair.generation == generation:
+            self._rejected_generation = generation
+        self._emit_session_log(
+            event="access_rejected",
+            purpose="recovery",
+            outcome="access_rejected",
+            operation=operation,
+            generation=generation,
+        )
+
+    async def _recover_access_rejection_locked(
+        self, *, generation_used: int, operation: str
+    ) -> None:
+        """Recover from GraphQL 401/403 on a locally unexpired pair.
+
+        Args:
+            generation_used: Generation used by the rejected GraphQL request.
+            operation: GraphQL operation name that was rejected.
+
+        Raises:
+            CarrierApiAuthError: If the session is unusable or login fails.
+            CarrierApiTokenRefreshError: If the session is closing or recovery
+                fails transiently.
+        """
+        if self._closing:
+            raise CarrierApiTokenRefreshError("Carrier token session is closing")
+        if self._state is TokenSessionState.AUTH_FAILED:
+            raise CarrierApiAuthError("Carrier token session is unusable", reason="unauthorized")
+        self._mark_access_rejected_locked(generation=generation_used, operation=operation)
+        if self.ws_generation != generation_used:
+            return
+        await self._recover_with_login_locked()
+
+    async def _execute_authed_graphql(
+        self,
+        auth_header: str,
+        operation_name: str,
+        query: GraphQLRequest,
+        variable_values: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute one authenticated GraphQL operation with a captured header.
+
+        Args:
+            auth_header: Authorization header captured under the token lock.
+            operation_name: GraphQL operation name to execute.
+            query: Parsed GraphQL request.
+            variable_values: Variables to send with the operation.
+
+        Returns:
+            The decoded GraphQL response data.
+        """
+        transport = AIOHTTPTransport(
+            url="https://dataservice.infinity.iot.carrier.com/graphql",
+            headers={"Authorization": auth_header},
+            ssl=True,
+        )
+        async with Client(
+            transport=transport,
+            fetch_schema_from_transport=False,
+            execute_timeout=GRAPHQL_EXECUTE_TIMEOUT_SECONDS,
+        ) as session:
+            return await session.execute(
+                query, variable_values=variable_values, operation_name=operation_name
+            )
 
     async def _ensure_tokens_locked(self) -> None:
         """Ensure a usable access token while already holding the token lock."""
@@ -573,6 +671,13 @@ class ApiConnectionGraphql:
             raise CarrierApiAuthError("Carrier token session is unusable", reason="unauthorized")
         if self._pair is None and self.refresh_token is None:
             await self.login()
+            return
+        if (
+            self._pair is not None
+            and self._rejected_generation is not None
+            and self._pair.generation == self._rejected_generation
+        ):
+            await self._recover_with_login_locked()
             return
         if self._seconds_until_expiry(self._now()) > 0:
             return
@@ -962,39 +1067,57 @@ class ApiConnectionGraphql:
         Returns:
             The decoded GraphQL response data.
         """
-        auth_header = await self.check_auth_expiration()
-        if auth_header is None:
-            raise CarrierApiTokenRefreshError("Carrier authorization header is unavailable")
-        transport = AIOHTTPTransport(
-            url="https://dataservice.infinity.iot.carrier.com/graphql",
-            headers={"Authorization": auth_header},
-            ssl=True,
-        )
-        try:
-            async with Client(
-                transport=transport,
-                fetch_schema_from_transport=False,
-                execute_timeout=GRAPHQL_EXECUTE_TIMEOUT_SECONDS,
-            ) as session:
-                return await session.execute(
-                    query, variable_values=variable_values, operation_name=operation_name
+        retried = False
+        while True:
+            async with self._held_token_lock():
+                await self._ensure_tokens_locked()
+                auth_header = self._authorization_header()
+                generation_used = self.ws_generation
+                rejected_generation_used = self._rejected_generation
+            await self._close_websocket_if_reconnect_required()
+            if auth_header is None:
+                raise CarrierApiTokenRefreshError("Carrier authorization header is unavailable")
+            try:
+                return await self._execute_authed_graphql(
+                    auth_header, operation_name, query, variable_values
                 )
-        except TransportQueryError as error:
-            raise CarrierApiGraphqlError(
-                f"Carrier GraphQL operation failed: {operation_name}"
-            ) from error
-        except _CONNECTION_ERRORS as error:
-            if _is_auth_transport_error(error):
-                raise CarrierApiAuthError(
-                    f"Carrier authorization failed during GraphQL operation: {operation_name}"
+            except TransportQueryError as error:
+                raise CarrierApiGraphqlError(
+                    f"Carrier GraphQL operation failed: {operation_name}"
                 ) from error
-            raise CarrierApiConnectionError(
-                f"Carrier connection failed during GraphQL operation: {operation_name}"
-            ) from error
-        except GraphQLError as error:
-            raise CarrierApiGraphqlError(
-                f"Carrier GraphQL operation failed: {operation_name}"
-            ) from error
+            except _CONNECTION_ERRORS as error:
+                if not _is_auth_transport_error(error):
+                    raise CarrierApiConnectionError(
+                        f"Carrier connection failed during GraphQL operation: {operation_name}"
+                    ) from error
+                unexpired = self._seconds_until_expiry(self._now()) > 0
+                already_rejected = (
+                    rejected_generation_used is not None
+                    and rejected_generation_used == generation_used
+                )
+                if retried or not (unexpired or already_rejected):
+                    raise CarrierApiAuthError(
+                        f"Carrier authorization failed during GraphQL operation: {operation_name}",
+                        reason="access_rejected" if retried else None,
+                    ) from error
+                async with self._held_token_lock():
+                    try:
+                        await self._recover_access_rejection_locked(
+                            generation_used=generation_used,
+                            operation=operation_name,
+                        )
+                    except CarrierApiAuthError:
+                        raise
+                    except (CarrierApiConnectionError, CarrierApiGraphqlError) as recover_error:
+                        raise CarrierApiTokenRefreshError(
+                            "Carrier assistedLogin recovery failed"
+                        ) from recover_error
+                await self._close_websocket_if_reconnect_required()
+                retried = True
+            except GraphQLError as error:
+                raise CarrierApiGraphqlError(
+                    f"Carrier GraphQL operation failed: {operation_name}"
+                ) from error
 
     async def get_user_info(self) -> dict[str, Any]:
         """Fetch Carrier account profile, location, and device metadata.
