@@ -77,6 +77,20 @@ _SESSION_OUTCOMES = frozenset(
 )
 _SESSION_WS_ACTIONS = frozenset({"none", "reconnect_requested", "left_connected"})
 _SESSION_PURPOSES = frozenset({"login", "refresh", "recovery"})
+_SESSION_OPERATIONS = frozenset(
+    {
+        "getUser",
+        "getInfinitySystems",
+        "getInfinityEnergy",
+        "getEntryLevelSystems",
+        "updateEntryLevelZone",
+        "updateInfinityConfig",
+        "updateInfinityZoneActivity",
+        "updateInfinityZoneConfig",
+        "assistedLogin",
+        "other",
+    }
+)
 SleepFn = Callable[[float], Awaitable[None]]
 TimeFn = Callable[[], datetime]
 TokenPairSource = Literal["login", "refresh", "recovery"]
@@ -201,6 +215,7 @@ class ApiConnectionGraphql:
         self._suppressed_refresh_fp: str | None = None
         self._token_generation = 0
         self._rejected_generation: int | None = None
+        self._access_recovery_disabled_count = 0
         self._closing = False
         self.reconnect_required = False
         self._now = time_fn or (lambda: datetime.now(UTC))
@@ -254,17 +269,45 @@ class ApiConnectionGraphql:
         except (ClientError, TimeoutError, OSError) as error:
             raise CarrierApiConnectionError("Carrier API session cleanup failed") from error
 
-    async def login(self) -> None:
+    async def login(self, *, expected_generation: int | None = None) -> None:
         """Authenticate with Carrier and initialize websocket support.
+
+        An integration-level login is skipped when ``expected_generation`` is
+        provided and is no longer the published generation. That caller is
+        treated as already recovered by an overlapping login.
+
+        Args:
+            expected_generation: Token generation observed at the failure that
+                requested this login. ``None`` always performs assistedLogin.
 
         Raises:
             CarrierApiAuthError: If the assisted login mutation reports an unsuccessful
                 authentication result.
         """
         async with self._held_token_lock():
+            if expected_generation is not None and self.ws_generation != expected_generation:
+                return
             await self._login_locked(purpose="login")
         if self._token_lock_owner is not asyncio.current_task():
             await self._close_websocket_if_reconnect_required()
+
+    @asynccontextmanager
+    async def no_recovery_authenticated_retry(self) -> AsyncIterator[None]:
+        """Disable ``authed_query`` 401/403 recovery for one authenticated retry.
+
+        While this context is active, the 401/403 handler raises
+        ``CarrierApiAuthError(reason="access_rejected")`` immediately instead of
+        starting assistedLogin. Home Assistant uses this after Gap 3(a) login
+        so the retried refresh cannot consume a second recovery budget.
+
+        Yields:
+            Nothing. Recovery is disabled until the context exits.
+        """
+        self._access_recovery_disabled_count += 1
+        try:
+            yield
+        finally:
+            self._access_recovery_disabled_count -= 1
 
     async def check_auth_expiration(self) -> str | None:
         """Ensure the connection has a valid access token before API use.
@@ -541,6 +584,10 @@ class ApiConnectionGraphql:
         safe_purpose = purpose if purpose in _SESSION_PURPOSES else "refresh"
         safe_outcome = outcome if outcome in _SESSION_OUTCOMES else "transient"
         safe_ws_action = ws_action if ws_action in _SESSION_WS_ACTIONS else "none"
+        if operation is None:
+            safe_operation = None
+        else:
+            safe_operation = operation if operation in _SESSION_OPERATIONS else "other"
         attempt_label = None if attempt is None else f"{attempt}/{RECOVERY_MAX_ATTEMPTS}"
         if access_valid is None:
             access_valid = self._seconds_until_expiry(self._now()) > 0
@@ -588,7 +635,7 @@ class ApiConnectionGraphql:
             recovery_eligible,
             suppressed,
             attempt_label,
-            operation,
+            safe_operation,
         )
 
     def _mark_access_rejected_locked(self, *, generation: int, operation: str) -> None:
@@ -1089,6 +1136,11 @@ class ApiConnectionGraphql:
                 if not _is_auth_transport_error(error):
                     raise CarrierApiConnectionError(
                         f"Carrier connection failed during GraphQL operation: {operation_name}"
+                    ) from error
+                if self._access_recovery_disabled_count > 0:
+                    raise CarrierApiAuthError(
+                        f"Carrier authorization failed during GraphQL operation: {operation_name}",
+                        reason="access_rejected",
                     ) from error
                 unexpired = self._seconds_until_expiry(self._now()) > 0
                 already_rejected = (

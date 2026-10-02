@@ -1340,3 +1340,114 @@ async def test_rejected_generation_not_returned_by_ensure_tokens(
     assert connection.access_token == "recovered-access"
     assert connection._rejected_generation is None
     assert connection.ws_generation == original.generation + 1
+
+
+class HoldingLogin:
+    """assistedLogin double that holds until the test releases it."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        """Store the payload returned after release.
+
+        Args:
+            payload: Successful assistedLogin GraphQL payload.
+        """
+        self._payload = payload
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self) -> dict[str, Any]:
+        """Block until the test releases this recovery login.
+
+        Returns:
+            The scripted assistedLogin payload.
+        """
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return self._payload
+
+
+@pytest.mark.asyncio
+async def test_staggered_authed_query_waves_share_one_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Callers that start on the rejected generation share one assistedLogin."""
+    session = CountingSession()
+    connection = _connection(session)
+    original = _install_pair(connection)
+    rejected_header = original.authorization()
+    client, stats = _generation_aware_graphql_client(
+        rejected_header=rejected_header,
+        first_wave=3,
+    )
+    login = HoldingLogin(
+        _login_payload(access_token="recovered-access", refresh_token="recovered-refresh")
+    )
+    monkeypatch.setattr("carrier_api.api_connection_graphql.Client", client)
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+
+    first_wave = [asyncio.create_task(_authed_query(connection)) for _ in range(3)]
+    await login.started.wait()
+    late = asyncio.create_task(_authed_query(connection))
+    await asyncio.sleep(0)
+    assert login.calls == 1
+    assert not late.done()
+    login.release.set()
+    results = await asyncio.gather(*first_wave, late)
+
+    assert results == [{"ok": True}, {"ok": True}, {"ok": True}, {"ok": True}]
+    assert login.calls == 1
+    assert session.posts == []
+    assert stats["rejected"] == 3
+    assert stats["successes"] == 4
+    assert connection.ws_generation == original.generation + 1
+    assert connection.access_token == "recovered-access"
+
+
+@pytest.mark.asyncio
+async def test_no_recovery_authenticated_retry_raises_access_rejected_without_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A no-recovery retry surfaces access_rejected without assistedLogin."""
+    session = CountingSession()
+    connection = _connection(session)
+    _install_pair(connection)
+    client, operations = _scripted_graphql_client(_auth_transport_error(401))
+    login = ScriptedLogin(
+        _login_payload(access_token="recovered-access", refresh_token="recovered-refresh")
+    )
+    monkeypatch.setattr("carrier_api.api_connection_graphql.Client", client)
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+
+    with pytest.raises(CarrierApiAuthError) as error:
+        async with connection.no_recovery_authenticated_retry():
+            await _authed_query(connection)
+
+    assert error.value.reason == "access_rejected"
+    assert login.calls == 0
+    assert session.posts == []
+    assert operations == ["getUser"]
+
+
+@pytest.mark.asyncio
+async def test_login_skips_when_expected_generation_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An integration login is skipped when the failed generation is gone."""
+    session = CountingSession()
+    connection = _connection(session)
+    original = _install_pair(connection)
+    login = ScriptedLogin(
+        _login_payload(access_token="recovered-access", refresh_token="recovered-refresh")
+    )
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+
+    await connection.login()
+    generation_after_login = connection.ws_generation
+    await connection.login(expected_generation=original.generation)
+
+    assert login.calls == 1
+    assert session.posts == []
+    assert connection.ws_generation == generation_after_login
+    assert connection.access_token == "recovered-access"

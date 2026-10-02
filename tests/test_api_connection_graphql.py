@@ -1166,6 +1166,33 @@ def test_production_fix_version_is_explicit() -> None:
     assert VERSION == "3.6.0+oauthfix.2"
 
 
+def test_emit_session_log_normalizes_secret_operation_labels(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unknown operation labels, including secret sentinels, become other."""
+    connection = _refresh_connection(FakeSession())
+    caplog.set_level(WARNING, logger="carrier_api.api_connection_graphql")
+    connection._emit_session_log(
+        event="access_rejected",
+        purpose="recovery",
+        outcome="access_rejected",
+        operation="getUser",
+    )
+    assert "operation=getUser" in caplog.text
+    for secret in _FORBIDDEN_LOG_SECRETS:
+        connection._emit_session_log(
+            event="access_rejected",
+            purpose="recovery",
+            outcome="access_rejected",
+            operation=secret,
+        )
+    _assert_logs_are_secret_safe(caplog)
+    warning_text = "\n".join(
+        record.getMessage() for record in caplog.records if record.levelno == WARNING
+    )
+    assert warning_text.count("operation=other") == len(_FORBIDDEN_LOG_SECRETS)
+
+
 @pytest.mark.asyncio
 async def test_releasing_response_body_is_unreadable_after_raise_for_status() -> None:
     """Prove the aiohttp-like fake loses its body after raise_for_status."""
