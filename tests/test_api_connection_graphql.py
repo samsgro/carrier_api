@@ -353,8 +353,13 @@ class SpyConnection(ApiConnectionGraphql):
         self.login_count = 0
         self.refresh_count = 0
 
-    async def login(self) -> None:
-        """Record login calls and seed token state."""
+    async def login(self, *, expected_generation: int | None = None) -> None:
+        """Record login calls and seed token state.
+
+        Args:
+            expected_generation: Generation gate accepted for compatibility with
+                the superclass signature.
+        """
         self.login_count += 1
         self.refresh_token = "refresh"
         self.expires_at = datetime.now(UTC) + timedelta(hours=1)

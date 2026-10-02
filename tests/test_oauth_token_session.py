@@ -1431,6 +1431,90 @@ async def test_no_recovery_authenticated_retry_raises_access_rejected_without_lo
 
 
 @pytest.mark.asyncio
+async def test_no_recovery_context_does_not_leak_to_sibling_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sibling started outside no-recovery still recovers its own 401."""
+    session = CountingSession()
+    connection = _connection(session)
+    original = _install_pair(connection)
+    rejected_header = original.authorization()
+    a_execute_started = asyncio.Event()
+    a_execute_release = asyncio.Event()
+    stats: dict[str, int] = {"rejected": 0, "successes": 0, "held": 0}
+
+    class SiblingLeakGraphQLClient:
+        """Reject one header; hold the first execute so caller A stays inside."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            """Capture the Authorization header from the constructed transport."""
+            transport = kwargs.get("transport")
+            headers = getattr(transport, "headers", None) or {}
+            self._authorization = headers.get("Authorization")
+
+        async def __aenter__(self) -> Self:
+            """Enter the fake session."""
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            """Exit the fake session."""
+
+        async def execute(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            """Hold the first rejected execute, then 401 or succeed.
+
+            Returns:
+                A dummy GraphQL success payload.
+
+            Raises:
+                TransportServerError: When the captured header is still rejected.
+            """
+            if self._authorization == rejected_header:
+                if not a_execute_started.is_set():
+                    stats["held"] += 1
+                    a_execute_started.set()
+                    await a_execute_release.wait()
+                stats["rejected"] += 1
+                raise _auth_transport_error(401)
+            stats["successes"] += 1
+            return {"ok": True}
+
+    login = HoldingLogin(
+        _login_payload(access_token="recovered-access", refresh_token="recovered-refresh")
+    )
+    monkeypatch.setattr("carrier_api.api_connection_graphql.Client", SiblingLeakGraphQLClient)
+    monkeypatch.setattr(connection, "_execute_assisted_login", login)
+
+    async def caller_a() -> dict[str, Any]:
+        """Run an authenticated query inside the no-recovery context."""
+        async with connection.no_recovery_authenticated_retry():
+            return await _authed_query(connection)
+
+    task_a = asyncio.create_task(caller_a())
+    await asyncio.wait_for(a_execute_started.wait(), timeout=1)
+    task_b = asyncio.create_task(_authed_query(connection))
+    await asyncio.wait_for(login.started.wait(), timeout=1)
+    assert login.calls == 1
+    assert not task_a.done()
+    assert not task_b.done()
+    login.release.set()
+    b_result = await asyncio.wait_for(task_b, timeout=1)
+    a_execute_release.set()
+
+    with pytest.raises(CarrierApiAuthError) as error:
+        await asyncio.wait_for(task_a, timeout=1)
+
+    assert error.value.reason == "access_rejected"
+    assert b_result == {"ok": True}
+    assert login.calls == 1
+    assert session.posts == []
+    assert stats["held"] == 1
+    assert stats["rejected"] == 2
+    assert stats["successes"] == 1
+    assert connection.ws_generation == original.generation + 1
+    assert connection.access_token == "recovered-access"
+
+
+@pytest.mark.asyncio
 async def test_login_skips_when_expected_generation_is_stale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

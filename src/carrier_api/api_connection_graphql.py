@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+import contextvars
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -215,7 +216,10 @@ class ApiConnectionGraphql:
         self._suppressed_refresh_fp: str | None = None
         self._token_generation = 0
         self._rejected_generation: int | None = None
-        self._access_recovery_disabled_count = 0
+        self._access_recovery_disabled: contextvars.ContextVar[int] = contextvars.ContextVar(
+            f"access_recovery_disabled_{id(self)}",
+            default=0,
+        )
         self._closing = False
         self.reconnect_required = False
         self._now = time_fn or (lambda: datetime.now(UTC))
@@ -293,21 +297,22 @@ class ApiConnectionGraphql:
 
     @asynccontextmanager
     async def no_recovery_authenticated_retry(self) -> AsyncIterator[None]:
-        """Disable ``authed_query`` 401/403 recovery for one authenticated retry.
+        """Disable ``authed_query`` 401/403 recovery for this task's retry.
 
-        While this context is active, the 401/403 handler raises
-        ``CarrierApiAuthError(reason="access_rejected")`` immediately instead of
-        starting assistedLogin. Home Assistant uses this after Gap 3(a) login
-        so the retried refresh cannot consume a second recovery budget.
+        The disabled count is stored in a per-connection ``ContextVar``. Nested
+        use increments the current context value. Child tasks spawned inside
+        inherit it; pre-existing sibling tasks do not. Home Assistant uses this
+        after Gap 3(a) login so the retried refresh cannot consume a second
+        recovery budget.
 
         Yields:
-            Nothing. Recovery is disabled until the context exits.
+            Nothing. Recovery is disabled in this context until exit.
         """
-        self._access_recovery_disabled_count += 1
+        token = self._access_recovery_disabled.set(self._access_recovery_disabled.get() + 1)
         try:
             yield
         finally:
-            self._access_recovery_disabled_count -= 1
+            self._access_recovery_disabled.reset(token)
 
     async def check_auth_expiration(self) -> str | None:
         """Ensure the connection has a valid access token before API use.
@@ -1137,7 +1142,7 @@ class ApiConnectionGraphql:
                     raise CarrierApiConnectionError(
                         f"Carrier connection failed during GraphQL operation: {operation_name}"
                     ) from error
-                if self._access_recovery_disabled_count > 0:
+                if self._access_recovery_disabled.get() > 0:
                     raise CarrierApiAuthError(
                         f"Carrier authorization failed during GraphQL operation: {operation_name}",
                         reason="access_rejected",
